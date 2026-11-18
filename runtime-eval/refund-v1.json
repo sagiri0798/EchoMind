@@ -1,0 +1,166 @@
+{
+  "suite": "refund-v1",
+  "task_type": "duplicate_charge_refund",
+  "说明": "确定性退款评测集（实施计划 13.3 节）。所有依赖均为沙箱：SQLite 账单数据、假知识库工具；不调用真实模型、真实支付或外网。v1 边界：金额/时间一致性不做业务校验（以实际扣款记录为准），时间窗政策校验未实现。",
+  "cases": [
+    {
+      "id": "normal_refund",
+      "description": "正常退款",
+      "user_id": "u1",
+      "message": "订单 #12345 这个月被扣了两次款，99 元，昨天支付的",
+      "kb": "ok",
+      "fault": null,
+      "actions": ["run", "approve", "run"],
+      "expect": {
+        "final_status": "SUCCEEDED",
+        "key_steps": ["SUBMIT_REFUND", "POLL_REFUND_STATUS", "BUILD_FINAL_ANSWER"],
+        "tools_called": ["submit_refund"],
+        "approval_decision": "approved",
+        "refund_count": 1,
+        "answer_contains": ["退款", "已原路退回"]
+      }
+    },
+    {
+      "id": "amount_mismatch",
+      "description": "金额不一致（用户声称 100 元，扣款记录 99 元；v1 以实际扣款记录为准）",
+      "user_id": "u1",
+      "message": "订单 #12345 被扣了两次款，每次 100 元，昨天支付的",
+      "kb": "ok",
+      "fault": null,
+      "actions": ["run", "approve", "run"],
+      "expect": {
+        "final_status": "SUCCEEDED",
+        "key_steps": ["SUBMIT_REFUND"],
+        "tools_called": ["submit_refund"],
+        "approval_decision": "approved",
+        "refund_count": 1,
+        "refund_amount_cents": 9900,
+        "answer_contains": ["退款"]
+      }
+    },
+    {
+      "id": "time_out_of_policy",
+      "description": "时间不在政策范围（v1 未实现时间窗校验，按正常流程处理）",
+      "user_id": "u1",
+      "message": "订单 #12345 在 2026-09-01 被扣了两次款，99 元",
+      "kb": "ok",
+      "fault": null,
+      "actions": ["run", "approve", "run"],
+      "expect": {
+        "final_status": "SUCCEEDED",
+        "key_steps": ["SUBMIT_REFUND"],
+        "tools_called": ["submit_refund"],
+        "approval_decision": "approved",
+        "refund_count": 1
+      }
+    },
+    {
+      "id": "order_not_owned",
+      "description": "订单不属于当前用户",
+      "user_id": "u2",
+      "message": "订单 #12345 被扣了两次款，99 元，昨天支付的",
+      "kb": "ok",
+      "fault": null,
+      "actions": ["run"],
+      "expect": {
+        "final_status": "FAILED",
+        "error_code": "order_not_found",
+        "refund_count": 0,
+        "tools_not_called": ["submit_refund"],
+        "answer_contains": ["核对订单号"]
+      }
+    },
+    {
+      "id": "no_duplicate",
+      "description": "无重复扣款",
+      "user_id": "u1",
+      "message": "订单 #67890 昨天支付了 199 元，帮我看看扣款记录",
+      "kb": "ok",
+      "fault": null,
+      "actions": ["run"],
+      "expect": {
+        "final_status": "SUCCEEDED",
+        "key_steps": ["BUILD_NO_REFUND_ANSWER"],
+        "tools_not_called": ["search_knowledge_base", "submit_refund"],
+        "refund_count": 0,
+        "answer_contains": ["没有发现重复扣款"]
+      }
+    },
+    {
+      "id": "kb_failure",
+      "description": "知识库失败",
+      "user_id": "u1",
+      "message": "订单 #12345 这个月被扣了两次款，99 元，昨天支付的",
+      "kb": "fail",
+      "fault": null,
+      "actions": ["run"],
+      "expect": {
+        "final_status": "FAILED",
+        "error_code": "knowledge_unavailable",
+        "refund_count": 0,
+        "tools_not_called": ["submit_refund"]
+      }
+    },
+    {
+      "id": "approval_rejected",
+      "description": "审批拒绝",
+      "user_id": "u1",
+      "message": "订单 #12345 这个月被扣了两次款，99 元，昨天支付的",
+      "kb": "ok",
+      "fault": null,
+      "actions": ["run", "reject"],
+      "expect": {
+        "final_status": "FAILED",
+        "error_code": "approval_rejected",
+        "approval_decision": "rejected",
+        "refund_count": 0,
+        "tools_not_called": ["submit_refund"],
+        "answer_contains": ["不执行退款"]
+      }
+    },
+    {
+      "id": "write_timeout_remote_success",
+      "description": "写操作超时但远端成功",
+      "user_id": "u1",
+      "message": "订单 #12345 这个月被扣了两次款，99 元，昨天支付的",
+      "kb": "ok",
+      "fault": "FAIL_AFTER_EFFECT_BEFORE_RESPONSE",
+      "actions": ["run", "approve", "run", "recover"],
+      "expect": {
+        "final_status": "SUCCEEDED",
+        "key_steps": ["SUBMIT_REFUND", "BUILD_FINAL_ANSWER"],
+        "approval_decision": "approved",
+        "refund_count": 1,
+        "answer_contains": ["退款"]
+      }
+    },
+    {
+      "id": "write_timeout_remote_not_executed",
+      "description": "写操作超时且远端未执行",
+      "user_id": "u1",
+      "message": "订单 #12345 这个月被扣了两次款，99 元，昨天支付的",
+      "kb": "ok",
+      "fault": null,
+      "actions": ["run", "approve", "simulate_unknown_no_effect", "recover"],
+      "expect": {
+        "final_status": "SUCCEEDED",
+        "approval_decision": "approved",
+        "refund_count": 1
+      }
+    },
+    {
+      "id": "user_cancelled",
+      "description": "用户要求取消",
+      "user_id": "u1",
+      "message": "订单 #12345 这个月被扣了两次款，99 元，昨天支付的",
+      "kb": "ok",
+      "fault": null,
+      "actions": ["run", "cancel"],
+      "expect": {
+        "final_status": "CANCELLED",
+        "refund_count": 0,
+        "tools_not_called": ["submit_refund"]
+      }
+    }
+  ]
+}

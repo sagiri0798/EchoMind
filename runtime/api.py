@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from core.redaction import redact
+from runtime import metrics as runtime_metrics
 from runtime.models import ApprovalDecision, RunStatus, StepStatus
 from runtime.store import (
     ApprovalAlreadyDecidedError,
@@ -315,6 +316,7 @@ async def decide_approval(run_id: str, body: ApprovalRequest, request: Request):
         raise HTTPException(409, str(ex)) from ex
     except ApprovalNotFoundError as ex:
         raise HTTPException(404, str(ex)) from ex
+    runtime_metrics.record_approval(decision.value)
     try:
         if decision == ApprovalDecision.REJECTED:
             # 拒绝：安全失败/升级路径，不执行退款；写工具相关步骤跳过

@@ -18,9 +18,11 @@ import json
 import logging
 import re
 import socket
+import time
 import uuid
 from typing import Callable, Dict, List, Optional
 
+from runtime import metrics as runtime_metrics
 from runtime.billing import BillingOutcomeUnknown, SandboxBillingClient
 from runtime.models import ApprovalDecision, Run, RunStatus, RunStep, StepStatus
 from runtime.plans import DUP_BRANCH, plan_for
@@ -109,6 +111,7 @@ class TaskEngine:
                         lease_owner=self._owner, error_code="engine_crash", retryable=True,
                         event_type="RUN_FAILED", event_payload={"error": str(ex)[:200]},
                     )
+                    runtime_metrics.record_run_terminal(run.task_type, RunStatus.FAILED.value)
                     await self._release_lease(run)
             except Exception:
                 logger.exception("失败状态写入也失败: %s", run_id)
@@ -155,11 +158,13 @@ class TaskEngine:
                 run_id, run.version, RunStatus.RUNNING,
                 lease_owner=self._owner, event_type="RUN_RESUMED",
             )
+            runtime_metrics.record_resume("approval")
         elif run.status in (RunStatus.OUTCOME_UNKNOWN, RunStatus.PAUSED):
             run = await self._store.update_run_status(
                 run_id, run.version, RunStatus.RUNNING,
                 lease_owner=self._owner, event_type="RUN_RESUMED",
             )
+            runtime_metrics.record_resume("recovery")
         context: dict = await self._rebuild_context(steps)
         if run.context_json:
             context.update(run.context_json)
@@ -182,6 +187,7 @@ class TaskEngine:
                     lease_owner=self._owner, event_type="RUN_CANCELLED",
                     event_payload={"by": "cancel_requested"},
                 )
+                runtime_metrics.record_run_terminal(run.task_type, RunStatus.CANCELLED.value)
                 await self._release_lease(run)
                 return
             # OUTCOME_UNKNOWN 对账：远端成功不重复提交，未执行复用同一幂等键
@@ -217,6 +223,7 @@ class TaskEngine:
         executor = self._executors.get(step.step_key)
         if executor is None:
             raise StepFailure(f"Step 未实现: {step.step_key}", "step_not_implemented")
+        started = time.monotonic()
         try:
             outcome = await executor(run, context, step)
         except StepFailure as ex:
@@ -225,6 +232,8 @@ class TaskEngine:
                 error_code=ex.error_code,
                 event_type="STEP_FAILED", event_payload={"error": ex.error_code},
             )
+            runtime_metrics.record_step(step.step_key, StepStatus.FAILED.value,
+                                        time.monotonic() - started)
             run = await self._store.update_run_status(
                 run.id, run.version, RunStatus.FAILED,
                 lease_owner=self._owner, error_code=ex.error_code, retryable=False,
@@ -232,6 +241,7 @@ class TaskEngine:
                 response_json={"response": ex.answer or f"处理失败：{ex}"},
                 event_type="RUN_FAILED", event_payload={"step": step.step_key},
             )
+            runtime_metrics.record_run_terminal(run.task_type, RunStatus.FAILED.value)
             await self._release_lease(run)
             context["_finished"] = True
             return
@@ -244,6 +254,8 @@ class TaskEngine:
                 event_type="STEP_NEEDS_INPUT",
                 event_payload={"missing": outcome.needs_user_input},
             )
+            runtime_metrics.record_step(step.step_key, StepStatus.READY.value,
+                                        time.monotonic() - started)
             run = await self._store.update_run_status(
                 run.id, run.version, RunStatus.WAITING_USER,
                 current_step=step.step_key, lease_owner=self._owner,
@@ -260,6 +272,8 @@ class TaskEngine:
             output_json=outcome.output, evidence_json=outcome.evidence,
             event_type="STEP_SUCCEEDED", event_payload={"step": step.step_key},
         )
+        runtime_metrics.record_step(step.step_key, StepStatus.SUCCEEDED.value,
+                                    time.monotonic() - started)
         if outcome.answer is not None:
             run = await self._store.update_run_status(
                 run.id, run.version, RunStatus.SUCCEEDED,
@@ -268,6 +282,7 @@ class TaskEngine:
                 response_json={"response": outcome.answer},
                 event_type="RUN_SUCCEEDED",
             )
+            runtime_metrics.record_run_terminal(run.task_type, RunStatus.SUCCEEDED.value)
             await self._commit_transcript(run, outcome.answer)
             await self._release_lease(run)
             context["_finished"] = True
@@ -307,6 +322,7 @@ class TaskEngine:
                     lease_owner=self._owner, error_code="refund_failed", retryable=False,
                     response_json={"response": "退款最终状态为失败，请核对账单或联系人工客服。"},
                     event_type="RUN_FAILED", event_payload={"reason": "refund_failed"})
+                runtime_metrics.record_run_terminal(run.task_type, RunStatus.FAILED.value)
                 await self._release_lease(run)
                 return False
             else:
@@ -346,6 +362,7 @@ class TaskEngine:
                 lease_owner=self._owner, error_code="plan_exhausted", retryable=False,
                 event_type="RUN_FAILED", event_payload={"reason": "plan_exhausted"},
             )
+            runtime_metrics.record_run_terminal(run.task_type, RunStatus.FAILED.value)
             await self._release_lease(run)
 
     async def _ensure_steps(self, run_id: str, run: Run) -> List[RunStep]:
@@ -558,6 +575,7 @@ class TaskEngine:
                 lease_owner=self._owner, error_code="approval_rejected", retryable=False,
                 response_json={"response": "退款申请未获批准，本次不执行退款。如有疑问请联系人工客服。"},
                 event_type="RUN_FAILED", event_payload={"reason": "approval_rejected"})
+            runtime_metrics.record_run_terminal(run.task_type, RunStatus.FAILED.value)
             await self._release_lease(run)
             context["_finished"] = True
             return StepOutcome()
@@ -570,6 +588,9 @@ class TaskEngine:
         """提交退款（写工具）：幂等键执行前落库；结果未知进入 OUTCOME_UNKNOWN 等待对账。"""
         proposal = context["proposal"]
         key = self._idempotency_key(run, step, proposal)
+        # 幂等键已存在退款记录：重放被拦截（指标口径见 12.2 节 duplicate_prevented）
+        if await self._billing.get_refund_status(key, run.user_id) is not None:
+            runtime_metrics.record_duplicate_prevented("submit_refund")
         # 执行写工具前持久化幂等键，重试复用相同键（9.2 节）
         await self._store.set_step_idempotency_key(
             run.id, step.step_key, key,
@@ -590,6 +611,7 @@ class TaskEngine:
                 run.id, run.version, RunStatus.OUTCOME_UNKNOWN,
                 lease_owner=self._owner, current_step=step.step_key,
                 event_type="OUTCOME_UNKNOWN")
+            runtime_metrics.record_outcome_unknown(run.task_type)
             await self._release_lease(run)
             context["_finished"] = True
             return StepOutcome()

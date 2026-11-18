@@ -573,6 +573,49 @@ docker compose exec -T echomind python tests/verify_chat_atomic.py
 
 <a id="deployment"></a>
 
+## 任务运行时（/runs，开发中）
+
+`/runs` 是可暂停、审批、恢复、取消与幂等执行的客服任务运行时，当前实现
+「重复扣款退款」固定 DAG。**所有业务依赖均为沙箱**：订单/扣款/退款使用独立
+SQLite 数据库模拟，不接真实支付系统；知识检索复用现有知识库工具。
+
+**边界声明（务必先读）**：
+
+- 沙箱账单数据只用于演示与测试，**不是真实支付/退款系统**；
+- 目标是「外部副作用至多一次，结果最终可确认」，**不是 exactly-once**；
+- v1 为固定 DAG，不做自由 Planner；金额/时间一致性不做业务校验（以实际扣款
+  记录为准），时间窗政策校验未实现；
+- 故障注入（`FAIL_BEFORE_EFFECT` 等）仅测试可用，生产代码路径不读取用户可控参数。
+
+典型流程：`POST /runs` 创建 → 轮询 `GET /runs/{id}` → 缺信息时 `resume` 补充 →
+`approval` 审批（通过后自动提交退款并轮询状态，拒绝则不执行退款）。
+
+### 故障排查
+
+| 现象 | 说明与处置 |
+| --- | --- |
+| `409` 状态转换/版本冲突 | 非法状态转换或 `expected_version` 过期。重新 `GET /runs/{id}` 取最新 version 再操作；终态不可回退。 |
+| Run 停在 `OUTCOME_UNKNOWN` | 写工具可能已执行但本地未确认。引擎对账 `get_refund_status`：远端成功则继续（不重复退款），未执行则用同一幂等键重提，仍处理中可再次 `resume` 或重启触发恢复扫描。 |
+| Run 停在 `WAITING_APPROVAL` | 等待人工审批。`approve` 后引擎继续；`reject` 进入安全失败路径，绝不执行退款。审批决定不可覆盖。 |
+| `WAITING_USER` | 任务缺少订单号/金额/支付时间，用 `resume` 补充后自动继续，不重建 Run。 |
+| 进程重启 | 启动时自动扫描：只读 Step 过期 RUNNING → READY 重试；写 Step → OUTCOME_UNKNOWN 对账。 |
+
+每条 Run 的 `GET /runs/{id}` 返回全部 Step、审批与脱敏 Event，可定位停在哪一步、
+为什么等待、哪个工具失败、是否已有外部副作用。指标见 `/metrics`（
+`echomind_runs_total` 等，标签不含用户正文/Token/订单号）。
+
+### 退款评测集
+
+`runtime-eval/refund-v1.json` 定义 10 个确定性用例（正常退款、金额不一致、
+时间不在政策范围、订单不属于用户、无重复扣款、知识库失败、审批拒绝、
+写超时远端成功/未执行、用户取消）。运行：
+
+```bash
+python -m pytest tests/test_runtime_eval.py -q
+```
+
+所有用例依赖沙箱与假知识库，不调用真实模型、支付或外网。
+
 ## 部署与数据管理
 
 ### API 访问鉴权
@@ -672,6 +715,7 @@ runtime/                       任务运行时（Task-Runtime-v1，开发中）
   plans.py                     v1 固定退款任务 DAG 与工具白名单
   engine.py                    租约执行器：逐 Step 检查点、审批门、幂等退款、对账收敛
   recovery.py                  启动扫描：崩溃遗留状态收敛与重调度
+  metrics.py                   Prometheus 指标（终态/耗时/恢复/审批/重复拦截）
 tooling/                       工具执行与标准 MCP
   tool_manager.py              缓存、超时、熔断、参数校验
   knowledge_base.py            知识库导入、切片与检索
