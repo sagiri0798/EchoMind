@@ -422,6 +422,7 @@ class RunStore:
         current_step: Optional[str] = None,
         lease_owner: Optional[str] = None,
         result_json: Optional[dict] = None,
+        response_json: Optional[dict] = None,
         error_code: Optional[str] = None,
         retryable: Optional[bool] = None,
         event_type: Optional[str] = None,
@@ -433,12 +434,12 @@ class RunStore:
         """
         return await asyncio.to_thread(
             self._update_run_status, run_id, expected_version, next_status,
-            current_step, lease_owner, result_json, error_code, retryable,
+            current_step, lease_owner, result_json, response_json, error_code, retryable,
             event_type, event_payload,
         )
 
     def _update_run_status(self, run_id, expected_version, next_status, current_step,
-                           lease_owner, result_json, error_code, retryable,
+                           lease_owner, result_json, response_json, error_code, retryable,
                            event_type, event_payload) -> Run:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -460,12 +461,14 @@ class RunStore:
             self._check_lease(run, lease_owner)
             finished_at = now_iso() if next_status in RUN_TERMINAL else None
             conn.execute(
-                "UPDATE runs SET status=?, current_step=?, result_json=?, error_code=?, "
-                "retryable=?, version=version+1, updated_at=?, finished_at=? WHERE id=?",
+                "UPDATE runs SET status=?, current_step=?, result_json=?, response_json=?, "
+                "error_code=?, retryable=?, version=version+1, updated_at=?, finished_at=? "
+                "WHERE id=?",
                 (
                     next_status.value,
                     current_step if current_step is not None else run.current_step,
                     _dumps(result_json) if result_json is not None else run.result_json and _dumps(run.result_json),
+                    _dumps(response_json) if response_json is not None else run.response_json and _dumps(run.response_json),
                     error_code if error_code is not None else run.error_code,
                     int(retryable) if retryable is not None else run.retryable,
                     now_iso(),
@@ -484,6 +487,7 @@ class RunStore:
             finished_at=finished_at or run.finished_at,
             current_step=current_step if current_step is not None else run.current_step,
             result_json=result_json if result_json is not None else run.result_json,
+            response_json=response_json if response_json is not None else run.response_json,
             error_code=error_code if error_code is not None else run.error_code,
             retryable=retryable if retryable is not None else run.retryable,
         )
@@ -533,6 +537,34 @@ class RunStore:
             )
             conn.execute("COMMIT")
         return dataclasses.replace(run, lease_owner=owner, lease_until=lease_until,
+                                   version=run.version + 1, updated_at=now_iso())
+
+    # ── 会话提交标记 ──────────────────────────────────
+
+    async def mark_transcript_committed(self, run_id: str, expected_version: int) -> Run:
+        """最终回答已一次性提交会话（11.4 节）。只标记，不改变状态机。"""
+        return await asyncio.to_thread(self._mark_transcript_committed, run_id, expected_version)
+
+    def _mark_transcript_committed(self, run_id: str, expected_version: int) -> Run:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise RunNotFoundError(f"Run 不存在: {run_id}")
+            run = _run_from_row(row)
+            if run.version != expected_version:
+                conn.execute("ROLLBACK")
+                raise VersionConflictError(
+                    f"版本冲突: 期望 {expected_version}，当前 {run.version}"
+                )
+            conn.execute(
+                "UPDATE runs SET transcript_committed=1, version=version+1, updated_at=? WHERE id=?",
+                (now_iso(), run_id),
+            )
+            self._insert_event(conn, run_id, "TRANSCRIPT_COMMITTED", None, {})
+            conn.execute("COMMIT")
+        return dataclasses.replace(run, transcript_committed=True,
                                    version=run.version + 1, updated_at=now_iso())
 
     # ── 取消 ──────────────────────────────────────────

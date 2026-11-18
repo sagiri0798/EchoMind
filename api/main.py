@@ -61,6 +61,8 @@ _skill_manager = None
 _profile_updater = None
 _mcp_client = None
 _runtime_store = None
+_billing = None
+_runtime_engine = None
 from evaluation.jobs import EvaluationJobs
 _eval_jobs = EvaluationJobs()
 
@@ -212,13 +214,48 @@ async def lifespan(app: FastAPI):
     # 任务运行时（/runs）：SQLite 持久化；初始化失败只影响 /runs，不拖垮 /chat
     try:
         from runtime.store import RunStore
-        from runtime.api import configure as configure_runs
+        from runtime.api import configure as configure_runs, configure_dispatch
+        from runtime.billing import SandboxBillingClient, demo_seed
+        from runtime.engine import TaskEngine
         runtime_db = pathlib.Path(os.getenv(
             "ECHOMIND_RUNTIME_DB", str(pathlib.Path(_ROOT) / "data/runtime/runtime.db")))
         runtime_db.parent.mkdir(parents=True, exist_ok=True)
         _runtime_store = RunStore(runtime_db)
         await _runtime_store.bootstrap()
         configure_runs(_runtime_store)
+
+        # 沙箱账单系统：独立数据库文件，模拟外部业务系统边界
+        billing_db = pathlib.Path(os.getenv(
+            "ECHOMIND_BILLING_DB", str(pathlib.Path(_ROOT) / "data/runtime/sandbox_billing.db")))
+        billing_db.parent.mkdir(parents=True, exist_ok=True)
+        _billing = SandboxBillingClient(billing_db)
+        await _billing.bootstrap()
+        if os.getenv("ECHOMIND_ENV", "development") == "development":
+            await _billing.seed(*demo_seed())  # 演示数据仅限开发环境，生产禁止自动写入
+
+        async def runtime_knowledge_search(params, ctx):
+            # DAG 白名单里的 search_knowledge_base → 现有底层 knowledge_search 工具
+            result = await _tool_manager.call("knowledge_search", params, ctx or {})
+            if not getattr(result, "success", False):
+                raise RuntimeError(getattr(result, "error", "知识库检索失败"))
+            return list(getattr(result, "data", None) or [])
+
+        async def commit_transcript(run, answer):
+            # 最终回答通过现有会话锁与整轮提交写入 Redis（11.4 节），不改变 /chat 语义
+            response = ChatResponse(conv_id=run.conv_id, request_id=run.client_request_id,
+                response=answer, intent="other", agent_type="general", escalated=False,
+                latency_ms=0, status="success")
+            message = (run.input_json or {}).get("message", "")
+            async with _memory.conversation(run.user_id, run.conv_id):
+                await _memory.commit_turn(run.user_id, run.conv_id, run.client_request_id,
+                                          message, response.model_dump())
+
+        _runtime_engine = TaskEngine(
+            _runtime_store, _billing,
+            tools={"search_knowledge_base": runtime_knowledge_search},
+            transcript_commit=commit_transcript,
+        )
+        configure_dispatch(_runtime_engine.schedule)
         logger.info(f"任务运行时已初始化: {runtime_db}")
     except Exception as ex:
         logger.warning("任务运行时初始化失败，/runs 接口不可用: %s", ex)
