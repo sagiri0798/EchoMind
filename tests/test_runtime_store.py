@@ -256,6 +256,58 @@ async def test_migration_adds_cancel_requested_column(tmp_path):
     conn.close()
 
 
+# ── 审批、幂等键与补充输入（PR5）──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_approval_create_is_idempotent_and_decide_once(store):
+    from runtime.models import ApprovalDecision
+    from runtime.store import ApprovalAlreadyDecidedError
+    run = await store.create_run(**make_run_fields())
+    first = await store.create_approval(run.id, "APPROVAL_GATE", "风险摘要")
+    second = await store.create_approval(run.id, "APPROVAL_GATE", "别的摘要")
+    assert first.id == second.id  # 幂等：不覆盖已存在的审批
+    assert (await store.get_approval(run.id, "APPROVAL_GATE")).risk_summary == "风险摘要"
+
+    decided = await store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.APPROVED,
+                                          decided_by="admin", comment="金额一致")
+    assert decided.decision == ApprovalDecision.APPROVED and decided.decided_at
+    # 审批只能决定一次
+    with pytest.raises(ApprovalAlreadyDecidedError):
+        await store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.REJECTED)
+    events = await store.get_events(run.id)
+    assert any(e.event_type == "APPROVAL_DECIDED" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_append_run_input_and_version(store):
+    run = await store.create_run(**make_run_fields())
+    updated = await store.append_run_input(run.id, run.version, "订单号是 #12345")
+    assert updated.input_json["supplements"] == ["订单号是 #12345"]
+    assert updated.version == run.version + 1
+    with pytest.raises(VersionConflictError):
+        await store.append_run_input(run.id, run.version, "旧版本写入")
+
+
+@pytest.mark.asyncio
+async def test_set_step_idempotency_key_persists_without_status_change(store):
+    run = await store.create_run(**make_run_fields())
+    await store.create_steps(run.id, [make_step_fields("SUBMIT_REFUND", 0)])
+    step = await store.set_step_idempotency_key(run.id, "SUBMIT_REFUND", "key-abc")
+    assert step.idempotency_key == "key-abc"
+    loaded = await store.get_step(run.id, "SUBMIT_REFUND")
+    assert loaded.idempotency_key == "key-abc" and loaded.status == StepStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_list_active_runs_filters_terminal(store):
+    run = await store.create_run(**make_run_fields())
+    assert [r.id for r in await store.list_active_runs()] == [run.id]
+    await store.update_run_status(run.id, 0, RunStatus.RUNNING)
+    await store.update_run_status(run.id, 1, RunStatus.SUCCEEDED)
+    assert await store.list_active_runs() == []
+
+
 # ── Step ──────────────────────────────────────────────
 
 

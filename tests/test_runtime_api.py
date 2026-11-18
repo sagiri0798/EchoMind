@@ -138,9 +138,10 @@ async def test_get_missing_run_returns_404(services):
 
 
 async def setup_run_at(store, status, run_fields=None):
-    fields = run_fields or dict(user_id="u1", conv_id="c1", client_request_id="msg-001",
-                                message_hash="h", task_type="duplicate_charge_refund",
-                                plan_version="v1")
+    fields = dict(user_id="u1", conv_id="c1", client_request_id="msg-001",
+                  message_hash="h", task_type="duplicate_charge_refund",
+                  plan_version="v1")
+    fields.update(run_fields or {})
     run = await store.create_run(**fields)
     if status == RunStatus.CREATED:
         return run
@@ -220,3 +221,127 @@ async def test_non_owner_cancel_is_hidden_and_admin_is_read_only(authed):
     run = await store.update_run_status(run_id, run.version, RunStatus.RUNNING)
     await store.update_run_status(run_id, run.version, RunStatus.WAITING_USER)
     assert (await http.post(f"/runs/{run_id}/cancel", headers=auth("token-user1-0000000000000000"))).status_code == 202
+
+
+# ── resume 与 approval（PR5）───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_resume_on_waiting_user_merges_input_and_dispatches(services, monkeypatch):
+    store, http = services
+    dispatched = []
+
+    async def fake_dispatch(run_id):
+        dispatched.append(run_id)
+
+    monkeypatch.setattr(runs_api, "_dispatch", fake_dispatch)
+
+    run = await setup_run_at(store, RunStatus.WAITING_USER)
+    version = run.version
+    resp = await http.post(f"/runs/{run.id}/resume",
+                           json={"message": "订单号是 #12345，99 元，昨天支付", "expected_version": version})
+    assert resp.status_code == 202
+    updated = await store.get_run(run.id)
+    assert updated.status == RunStatus.RUNNING
+    assert updated.input_json["supplements"] == ["订单号是 #12345，99 元，昨天支付"]
+    assert dispatched == [run.id]  # 恢复后调度引擎继续
+
+
+@pytest.mark.asyncio
+async def test_resume_version_mismatch_and_terminal_conflicts(services):
+    store, http = services
+    run = await setup_run_at(store, RunStatus.WAITING_USER)
+    resp = await http.post(f"/runs/{run.id}/resume",
+                           json={"message": "补充", "expected_version": run.version + 99})
+    assert resp.status_code == 409
+    done = await setup_run_at(store, RunStatus.SUCCEEDED,
+                              run_fields=dict(client_request_id="msg-002"))
+    resp = await http.post(f"/runs/{done.id}/resume",
+                           json={"message": "补充", "expected_version": done.version})
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_approval_flow_and_decide_once(services, monkeypatch):
+    from runtime.models import ApprovalDecision
+    store, http = services
+    dispatched = []
+
+    async def fake_dispatch(run_id):
+        dispatched.append(run_id)
+
+    monkeypatch.setattr(runs_api, "_dispatch", fake_dispatch)
+
+    run = await setup_run_at(store, RunStatus.WAITING_APPROVAL)
+    await store.create_approval(run.id, "APPROVAL_GATE", "风险摘要")
+
+    resp = await http.post(f"/runs/{run.id}/approval",
+                           json={"step_key": "APPROVAL_GATE", "decision": "approve",
+                                 "comment": "金额一致", "expected_version": run.version})
+    assert resp.status_code == 202 and resp.json()["decision"] == "approved"
+    assert (await store.get_approval(run.id, "APPROVAL_GATE")).decision == ApprovalDecision.APPROVED
+    assert (await store.get_run(run.id)).status == RunStatus.RUNNING
+    assert dispatched == [run.id]
+
+    # 决定不可覆盖
+    run = await store.get_run(run.id)
+    again = await http.post(f"/runs/{run.id}/approval",
+                            json={"step_key": "APPROVAL_GATE", "decision": "reject",
+                                  "expected_version": run.version})
+    assert again.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_approval_reject_fails_run_safely(services):
+    from runtime.models import ApprovalDecision, StepStatus
+    from runtime.plans import plan_for
+    store, http = services
+    run = await setup_run_at(store, RunStatus.WAITING_APPROVAL)
+    await store.create_steps(run.id, plan_for(run.task_type))
+    for _from, _to in ((StepStatus.PENDING, StepStatus.READY),
+                       (StepStatus.READY, StepStatus.RUNNING),
+                       (StepStatus.RUNNING, StepStatus.WAITING_APPROVAL)):
+        await store.update_step_status(run.id, "APPROVAL_GATE", _from, _to)
+    await store.create_approval(run.id, "APPROVAL_GATE", "风险摘要")
+
+    resp = await http.post(f"/runs/{run.id}/approval",
+                           json={"step_key": "APPROVAL_GATE", "decision": "reject",
+                                 "expected_version": run.version})
+    assert resp.status_code == 202 and resp.json()["decision"] == "rejected"
+    final = await store.get_run(run.id)
+    assert final.status == RunStatus.FAILED and final.error_code == "approval_rejected"
+    assert "不执行退款" in final.response_json["response"]
+    assert (await store.get_step(run.id, "APPROVAL_GATE")).status == StepStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_approval_permissions_and_missing(authed):
+    store, http, tokens = authed
+    run_id = (await http.post("/runs", json=body(), headers=auth("token-user1-0000000000000000"))).json()["run_id"]
+    run = await store.get_run(run_id)
+    run = await store.update_run_status(run_id, run.version, RunStatus.RUNNING)
+    run = await store.update_run_status(run_id, run.version, RunStatus.WAITING_APPROVAL)
+    await store.create_approval(run_id, "APPROVAL_GATE", "风险摘要")
+
+    # 无审批记录 → 404
+    other = (await http.post("/runs", json=body(client_request_id="msg-002"), headers=auth("token-user1-0000000000000000"))).json()["run_id"]
+    other_run = await store.get_run(other)
+    other_run = await store.update_run_status(other, other_run.version, RunStatus.RUNNING)
+    other_run = await store.update_run_status(other, other_run.version, RunStatus.WAITING_APPROVAL)
+    resp = await http.post(f"/runs/{other}/approval",
+                           json={"step_key": "APPROVAL_GATE", "decision": "approve",
+                                 "expected_version": other_run.version},
+                           headers=auth("token-user1-0000000000000000"))
+    assert resp.status_code == 404
+    # 其他用户审批 → 404 隐藏资源存在性
+    resp = await http.post(f"/runs/{run_id}/approval",
+                           json={"step_key": "APPROVAL_GATE", "decision": "approve",
+                                 "expected_version": run.version},
+                           headers=auth("token-user2-0000000000000000"))
+    assert resp.status_code == 404
+    # 管理员可以审批（7.4 节：所有者或管理员）
+    resp = await http.post(f"/runs/{run_id}/approval",
+                           json={"step_key": "APPROVAL_GATE", "decision": "approve",
+                                 "expected_version": run.version},
+                           headers=auth("token-admin-0000000000000000"))
+    assert resp.status_code == 202 and resp.json()["decision"] == "approved"

@@ -2,7 +2,9 @@
 
 转换表与 Task-Runtime-v1 实施计划第 5.3 节一致。与计划相比的补充：
 - Step 的 RUNNING → READY 用于只读 Step 过期后的恢复重试（11.3 节）；
-- Step 的 FAILED → READY 允许按 attempt 重试（9.2 节幂等键保证写操作不重复）。
+- Step 的 FAILED → READY 允许按 attempt 重试（9.2 节幂等键保证写操作不重复）；
+- Step 的 OUTCOME_UNKNOWN → READY 用于对账发现远端未执行/处理中时，
+  以同一幂等键重提（写操作幂等，不会重复退款）。
 """
 from runtime.models import RunStatus, StepStatus
 
@@ -32,7 +34,9 @@ STEP_TRANSITIONS: dict[StepStatus, frozenset[StepStatus]] = {
     StepStatus.SUCCEEDED:        frozenset(),
     StepStatus.FAILED:           frozenset({StepStatus.READY}),
     StepStatus.SKIPPED:          frozenset(),
-    StepStatus.OUTCOME_UNKNOWN:  frozenset({StepStatus.RUNNING, StepStatus.SUCCEEDED, StepStatus.FAILED}),
+    StepStatus.OUTCOME_UNKNOWN:  frozenset({
+        StepStatus.RUNNING, StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.READY,
+    }),
 }
 
 RUN_TERMINAL = frozenset({RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED})

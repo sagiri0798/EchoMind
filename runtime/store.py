@@ -539,6 +539,48 @@ class RunStore:
         return dataclasses.replace(run, lease_owner=owner, lease_until=lease_until,
                                    version=run.version + 1, updated_at=now_iso())
 
+    # ── 补充输入与活动列表 ────────────────────────────
+
+    async def append_run_input(self, run_id: str, expected_version: int, message: str) -> Run:
+        """把用户补充输入追加到 input_json.supplements（resume 用，7.3 节）。"""
+        return await asyncio.to_thread(self._append_run_input, run_id, expected_version, message)
+
+    def _append_run_input(self, run_id: str, expected_version: int, message: str) -> Run:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise RunNotFoundError(f"Run 不存在: {run_id}")
+            run = _run_from_row(row)
+            if run.version != expected_version:
+                conn.execute("ROLLBACK")
+                raise VersionConflictError(
+                    f"版本冲突: 期望 {expected_version}，当前 {run.version}"
+                )
+            updated_input = dict(run.input_json or {})
+            updated_input.setdefault("supplements", []).append(message)
+            conn.execute(
+                "UPDATE runs SET input_json=?, version=version+1, updated_at=? WHERE id=?",
+                (_dumps(updated_input), now_iso(), run_id),
+            )
+            self._insert_event(conn, run_id, "RUN_RESUMED", None, {"reason": "user_input"})
+            conn.execute("COMMIT")
+        return dataclasses.replace(run, input_json=updated_input,
+                                   version=run.version + 1, updated_at=now_iso())
+
+    async def list_active_runs(self) -> list[Run]:
+        """返回所有非终态 Run（恢复扫描用，11.3 节）。"""
+        return await asyncio.to_thread(self._list_active_runs)
+
+    def _list_active_runs(self) -> list[Run]:
+        terminal = ", ".join(f"'{status.value}'" for status in RUN_TERMINAL)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM runs WHERE status NOT IN ({terminal}) ORDER BY created_at ASC"
+            ).fetchall()
+            return [_run_from_row(row) for row in rows]
+
     # ── 会话提交标记 ──────────────────────────────────
 
     async def mark_transcript_committed(self, run_id: str, expected_version: int) -> Run:
@@ -606,6 +648,32 @@ class RunStore:
         return dataclasses.replace(run, cancel_requested=True, version=run.version + 1,
                                    updated_at=now_iso())
 
+    async def release_lease(self, run_id: str, expected_version: int) -> Run:
+        """释放租约（引擎停靠到等待态/终态时调用），用户操作不受租约阻塞。"""
+        return await asyncio.to_thread(self._release_lease, run_id, expected_version)
+
+    def _release_lease(self, run_id: str, expected_version: int) -> Run:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise RunNotFoundError(f"Run 不存在: {run_id}")
+            run = _run_from_row(row)
+            if run.version != expected_version:
+                conn.execute("ROLLBACK")
+                raise VersionConflictError(
+                    f"版本冲突: 期望 {expected_version}，当前 {run.version}"
+                )
+            conn.execute(
+                "UPDATE runs SET lease_owner=NULL, lease_until=NULL, version=version+1, "
+                "updated_at=? WHERE id=?",
+                (now_iso(), run_id),
+            )
+            conn.execute("COMMIT")
+        return dataclasses.replace(run, lease_owner=None, lease_until=None,
+                                   version=run.version + 1, updated_at=now_iso())
+
     # ── Step ──────────────────────────────────────────
 
     async def create_steps(self, run_id: str, steps: list[RunStep]) -> None:
@@ -659,20 +727,26 @@ class RunStore:
         next_status: StepStatus,
         *,
         attempt: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
         output_json: Optional[dict] = None,
         evidence_json: Optional[dict] = None,
         error_code: Optional[str] = None,
         event_type: Optional[str] = None,
         event_payload: Optional[dict] = None,
     ) -> RunStep:
-        """Step 状态转换：期望状态不匹配（CAS）或转换非法时拒绝，事务回滚。"""
+        """Step 状态转换：期望状态不匹配（CAS）或转换非法时拒绝，事务回滚。
+
+        idempotency_key 在执行写工具前持久化（9.2 节），重试复用相同键。
+        """
         return await asyncio.to_thread(
             self._update_step_status, run_id, step_key, expected_status, next_status,
-            attempt, output_json, evidence_json, error_code, event_type, event_payload,
+            attempt, idempotency_key, output_json, evidence_json, error_code,
+            event_type, event_payload,
         )
 
     def _update_step_status(self, run_id, step_key, expected_status, next_status, attempt,
-                            output_json, evidence_json, error_code, event_type, event_payload) -> RunStep:
+                            idempotency_key, output_json, evidence_json, error_code,
+                            event_type, event_payload) -> RunStep:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -697,12 +771,13 @@ class RunStore:
                 else step.started_at
             finished_at = now_iso() if next_status in STEP_TERMINAL else None
             conn.execute(
-                "UPDATE run_steps SET status=?, attempt=?, output_json=?, evidence_json=?, "
-                "error_code=?, started_at=?, finished_at=? "
+                "UPDATE run_steps SET status=?, attempt=?, idempotency_key=?, output_json=?, "
+                "evidence_json=?, error_code=?, started_at=?, finished_at=? "
                 "WHERE run_id=? AND step_key=?",
                 (
                     next_status.value,
                     attempt if attempt is not None else step.attempt,
+                    idempotency_key if idempotency_key is not None else step.idempotency_key,
                     _dumps(output_json) if output_json is not None else step.output_json and _dumps(step.output_json),
                     _dumps(evidence_json) if evidence_json is not None else step.evidence_json and _dumps(step.evidence_json),
                     error_code if error_code is not None else step.error_code,
@@ -719,6 +794,7 @@ class RunStore:
             step,
             status=next_status,
             attempt=attempt if attempt is not None else step.attempt,
+            idempotency_key=idempotency_key if idempotency_key is not None else step.idempotency_key,
             output_json=output_json if output_json is not None else step.output_json,
             evidence_json=evidence_json if evidence_json is not None else step.evidence_json,
             error_code=error_code if error_code is not None else step.error_code,
@@ -726,7 +802,101 @@ class RunStore:
             finished_at=finished_at or step.finished_at,
         )
 
+    async def set_step_idempotency_key(self, run_id: str, step_key: str, key: str, *,
+                                       event_type: Optional[str] = None,
+                                       event_payload: Optional[dict] = None) -> RunStep:
+        """执行写工具前持久化幂等键（9.2 节），不改变 Step 状态。"""
+        return await asyncio.to_thread(
+            self._set_step_idempotency_key, run_id, step_key, key, event_type, event_payload)
+
+    def _set_step_idempotency_key(self, run_id, step_key, key, event_type, event_payload) -> RunStep:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM run_steps WHERE run_id=? AND step_key=?", (run_id, step_key)
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise StepNotFoundError(f"Step 不存在: {run_id}/{step_key}")
+            conn.execute(
+                "UPDATE run_steps SET idempotency_key=? WHERE run_id=? AND step_key=?",
+                (key, run_id, step_key),
+            )
+            if event_type:
+                self._insert_event(conn, run_id, event_type, step_key, event_payload)
+            conn.execute("COMMIT")
+        return dataclasses.replace(_step_from_row(row), idempotency_key=key)
+
     # ── 审批 ──────────────────────────────────────────
+
+    async def create_approval(self, run_id: str, step_key: str, risk_summary: str) -> RunApproval:
+        """创建待审批记录。幂等：同 (run_id, step_key) 已有记录时返回原记录。"""
+        return await asyncio.to_thread(self._create_approval, run_id, step_key, risk_summary)
+
+    def _create_approval(self, run_id: str, step_key: str, risk_summary: str) -> RunApproval:
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM run_approvals WHERE run_id=? AND step_key=?",
+                (run_id, step_key),
+            ).fetchone()
+            if existing is not None:
+                return _approval_from_row(existing)
+            approval = RunApproval(run_id=run_id, step_key=step_key, risk_summary=risk_summary)
+            conn.execute(
+                "INSERT INTO run_approvals (id, run_id, step_key, risk_summary, decision, "
+                "decided_by, comment, created_at, decided_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (approval.id, approval.run_id, approval.step_key, approval.risk_summary,
+                 approval.decision.value, approval.decided_by, approval.comment,
+                 approval.created_at, approval.decided_at),
+            )
+            return approval
+
+    async def get_approval(self, run_id: str, step_key: str) -> Optional[RunApproval]:
+        """按 (run_id, step_key) 查审批记录；不存在返回 None。"""
+        return await asyncio.to_thread(self._get_approval, run_id, step_key)
+
+    def _get_approval(self, run_id: str, step_key: str) -> Optional[RunApproval]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM run_approvals WHERE run_id=? AND step_key=?",
+                (run_id, step_key),
+            ).fetchone()
+            return _approval_from_row(row) if row else None
+
+    async def decide_approval(self, run_id: str, step_key: str, decision: ApprovalDecision,
+                              decided_by: Optional[str] = None,
+                              comment: Optional[str] = None) -> RunApproval:
+        """审批决定只允许一次：重复决定抛 ApprovalAlreadyDecidedError（不可覆盖）。"""
+        return await asyncio.to_thread(
+            self._decide_approval, run_id, step_key, decision, decided_by, comment)
+
+    def _decide_approval(self, run_id, step_key, decision, decided_by, comment) -> RunApproval:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM run_approvals WHERE run_id=? AND step_key=?",
+                (run_id, step_key),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise ApprovalNotFoundError(f"审批不存在: {run_id}/{step_key}")
+            approval = _approval_from_row(row)
+            if approval.decision != ApprovalDecision.PENDING:
+                conn.execute("ROLLBACK")
+                raise ApprovalAlreadyDecidedError(
+                    f"审批已决定为 {approval.decision.value}，不可覆盖")
+            decided_at = now_iso()
+            conn.execute(
+                "UPDATE run_approvals SET decision=?, decided_by=?, comment=?, decided_at=? "
+                "WHERE id=?",
+                (decision.value, decided_by, comment, decided_at, approval.id),
+            )
+            self._insert_event(conn, run_id, "APPROVAL_DECIDED", step_key,
+                               {"decision": decision.value, "decided_by": decided_by})
+            conn.execute("COMMIT")
+        return dataclasses.replace(approval, decision=decision, decided_by=decided_by,
+                                   comment=comment, decided_at=decided_at)
 
     async def get_approvals(self, run_id: str) -> list[RunApproval]:
         """按创建顺序返回全部审批记录。创建/决定方法在 PR5 实现。"""

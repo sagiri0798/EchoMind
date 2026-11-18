@@ -1,11 +1,19 @@
-"""沙箱账单客户端测试：属主隔离、查询稳定性与种子数据（PR3 验收）。
+"""沙箱账单客户端测试：属主隔离、查询稳定性、退款幂等与故障注入（PR3/PR5 验收）。
 
 不依赖真实外部服务、Redis 或模型；每次测试使用独立临时 SQLite 文件。
 """
 import pytest
 import pytest_asyncio
 
-from runtime.billing import SandboxBillingClient, demo_seed
+from runtime.billing import (
+    BillingOutcomeUnknown,
+    BillingUnavailable,
+    FAIL_AFTER_EFFECT_BEFORE_RESPONSE,
+    FAIL_BEFORE_EFFECT,
+    RefundConflictError,
+    SandboxBillingClient,
+    demo_seed,
+)
 
 
 @pytest_asyncio.fixture
@@ -83,3 +91,61 @@ async def test_seed_is_replace_idempotent(billing):
     await billing.seed(orders, charges)
     await billing.seed(orders, charges)  # 重复播种不产生重复记录
     assert len(await billing.get_charges("12345", "u1")) == 2
+
+
+# ── 退款写入：幂等与冲突（PR5）──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_submit_refund_creates_record_and_is_idempotent(seeded):
+    record = await seeded.submit_refund("12345", "u1", 9900, "重复扣款", operation_id="op-1")
+    assert record["status"] == "submitted" and record["operation_id"] == "op-1"
+    # 相同 operation_id 重复提交：返回相同退款记录，不产生第二条
+    again = await seeded.submit_refund("12345", "u1", 9900, "重复扣款", operation_id="op-1")
+    assert again["created_at"] == record["created_at"]
+
+
+@pytest.mark.asyncio
+async def test_submit_refund_conflicts_on_same_operation_id_different_params(seeded):
+    await seeded.submit_refund("12345", "u1", 9900, "重复扣款", operation_id="op-1")
+    with pytest.raises(RefundConflictError):
+        await seeded.submit_refund("12345", "u1", 5000, "别的理由", operation_id="op-1")
+
+
+@pytest.mark.asyncio
+async def test_submit_refund_requires_order_ownership(seeded):
+    with pytest.raises(RefundConflictError):
+        await seeded.submit_refund("12345", "u2", 9900, "重复扣款", operation_id="op-x")
+    with pytest.raises(RefundConflictError):
+        await seeded.submit_refund("不存在", "u1", 9900, "重复扣款", operation_id="op-y")
+
+
+@pytest.mark.asyncio
+async def test_refund_status_ladder_and_isolation(seeded):
+    await seeded.submit_refund("12345", "u1", 9900, "重复扣款", operation_id="op-1")
+    assert (await seeded.get_refund_status("op-1", "u1"))["status"] == "processing"
+    assert (await seeded.get_refund_status("op-1", "u1"))["status"] == "succeeded"
+    # 未执行或跨用户查询均按不存在处理
+    assert await seeded.get_refund_status("op-none", "u1") is None
+    assert await seeded.get_refund_status("op-1", "u2") is None
+
+
+# ── 故障注入（仅测试）───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fault_before_effect_leaves_no_record(seeded):
+    seeded.enable_fault(FAIL_BEFORE_EFFECT)
+    with pytest.raises(BillingUnavailable):
+        await seeded.submit_refund("12345", "u1", 9900, "重复扣款", operation_id="op-f1")
+    assert await seeded.get_refund_status("op-f1", "u1") is None  # 副作用未发生
+
+
+@pytest.mark.asyncio
+async def test_fault_after_effect_before_response_leaves_record(seeded):
+    seeded.enable_fault(FAIL_AFTER_EFFECT_BEFORE_RESPONSE)
+    with pytest.raises(BillingOutcomeUnknown):
+        await seeded.submit_refund("12345", "u1", 9900, "重复扣款", operation_id="op-f2")
+    # 副作用已发生：记录存在，可通过查询对账
+    record = await seeded.get_refund_status("op-f2", "u1")
+    assert record is not None and record["order_id"] == "12345"

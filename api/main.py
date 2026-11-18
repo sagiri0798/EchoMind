@@ -256,6 +256,13 @@ async def lifespan(app: FastAPI):
             transcript_commit=commit_transcript,
         )
         configure_dispatch(_runtime_engine.schedule)
+
+        # 启动恢复：扫描崩溃遗留的 Run 并重新调度（11.3 节）
+        from runtime.recovery import TaskRecovery
+        _runtime_recovery = TaskRecovery(_runtime_store, _billing)
+        for recovered_id in await _runtime_recovery.scan():
+            _runtime_engine.schedule(recovered_id)
+
         logger.info(f"任务运行时已初始化: {runtime_db}")
     except Exception as ex:
         logger.warning("任务运行时初始化失败，/runs 接口不可用: %s", ex)

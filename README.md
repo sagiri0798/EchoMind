@@ -668,9 +668,10 @@ runtime/                       任务运行时（Task-Runtime-v1，开发中）
   state_machine.py             合法状态转换与终态判断
   store.py                     SQLite 持久化、版本与租约校验
   api.py                       /runs 接口：创建、查询、取消与资源隔离
-  billing.py                   沙箱账单/退款系统（属主隔离的只读查询）
+  billing.py                   沙箱账单/退款系统（属主隔离、退款幂等与故障注入）
   plans.py                     v1 固定退款任务 DAG 与工具白名单
-  engine.py                    租约执行器：逐 Step 检查点、取消安全检查点、会话提交
+  engine.py                    租约执行器：逐 Step 检查点、审批门、幂等退款、对账收敛
+  recovery.py                  启动扫描：崩溃遗留状态收敛与重调度
 tooling/                       工具执行与标准 MCP
   tool_manager.py              缓存、超时、熔断、参数校验
   knowledge_base.py            知识库导入、切片与检索

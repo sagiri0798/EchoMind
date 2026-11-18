@@ -183,3 +183,49 @@ async def test_two_engines_only_one_executes(env):
     assert final.status == RunStatus.WAITING_APPROVAL
     # 只有获得租约的 runner 执行了知识检索
     assert len(env.search_calls) == 1
+
+
+# ── 审批与退款全流程（PR5）─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_approved_refund_flow_submits_once_and_succeeds(env):
+    from runtime.models import ApprovalDecision
+    run = await create_run(env.store)
+    await env.engine.run(run.id)
+    run = await env.store.get_run(run.id)
+    assert run.status == RunStatus.WAITING_APPROVAL
+
+    # 审批通过（API 在 PR5 里做的事：决定 + 转回 RUNNING + 调度）
+    await env.store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.APPROVED,
+                                    decided_by="admin")
+    await env.store.update_run_status(run.id, run.version, RunStatus.RUNNING,
+                                      event_type="RUN_RESUMED")
+    await env.engine.run(run.id)
+
+    final = await env.store.get_run(run.id)
+    assert final.status == RunStatus.SUCCEEDED
+    assert "已原路退回" in final.response_json["response"]
+    assert final.transcript_committed is True and len(env.committed) == 1
+    # 审批通过 → 退款只提交一次
+    import sqlite3
+    conn = sqlite3.connect(env.billing.path)
+    count = conn.execute("SELECT COUNT(*) FROM refunds").fetchone()[0]
+    conn.close()
+    assert count == 1
+    steps = {s.step_key: s for s in await env.store.get_steps(run.id)}
+    assert steps["SUBMIT_REFUND"].status == StepStatus.SUCCEEDED
+    assert steps["POLL_REFUND_STATUS"].status == StepStatus.SUCCEEDED
+    assert steps["BUILD_FINAL_ANSWER"].status == StepStatus.SUCCEEDED
+    assert steps["SUBMIT_REFUND"].idempotency_key  # 幂等键已持久化
+
+
+@pytest.mark.asyncio
+async def test_approval_required_before_any_refund_submit(env):
+    run = await create_run(env.store)
+    await env.engine.run(run.id)  # 停在 WAITING_APPROVAL
+    import sqlite3
+    conn = sqlite3.connect(env.billing.path)
+    count = conn.execute("SELECT COUNT(*) FROM refunds").fetchone()[0]
+    conn.close()
+    assert count == 0  # 审批前绝不执行退款

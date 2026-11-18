@@ -7,14 +7,16 @@
 import hashlib
 import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from core.redaction import redact
-from runtime.models import RunStatus
+from runtime.models import ApprovalDecision, RunStatus, StepStatus
 from runtime.store import (
+    ApprovalAlreadyDecidedError,
+    ApprovalNotFoundError,
     IllegalTransitionError,
     LeaseConflictError,
     LeaseLostError,
@@ -218,6 +220,8 @@ async def get_run(run_id: str, request: Request):
 
 _CANCELABLE_WAITING = {RunStatus.WAITING_USER, RunStatus.WAITING_APPROVAL, RunStatus.PAUSED}
 
+_RESUMABLE = {RunStatus.WAITING_USER, RunStatus.PAUSED, RunStatus.OUTCOME_UNKNOWN, RunStatus.RUNNING}
+
 
 @router.post("/runs/{run_id}/cancel", status_code=202)
 async def cancel_run(run_id: str, request: Request):
@@ -246,3 +250,99 @@ async def cancel_run(run_id: str, request: Request):
         raise HTTPException(409, str(ex)) from ex
     return {"run_id": run_id, "status": updated.status.value,
             "cancel_requested": updated.cancel_requested}
+
+
+class RunResumeRequest(BaseModel):
+    message:          str = Field(min_length=1, max_length=12000)
+    expected_version: int = Field(ge=0)
+
+
+class ApprovalRequest(BaseModel):
+    step_key:         str = Field(min_length=1, max_length=64)
+    decision:         Literal["approve", "reject"]
+    comment:          str = Field(default="", max_length=500)
+    expected_version: int = Field(ge=0)
+
+
+@router.post("/runs/{run_id}/resume", status_code=202)
+async def resume_run(run_id: str, body: RunResumeRequest, request: Request):
+    """恢复/补充输入（7.3 节）：补充输入合并进任务，不重新创建 Run、不扩大工具权限。"""
+    store = _require_store()
+    run = await _load_owned_run(store, request, run_id)
+    account = getattr(request.state, "account", None)
+    if account and run.user_id != account["user_id"]:
+        raise HTTPException(403, "仅任务所有者可以恢复")
+    if run.status not in _RESUMABLE:
+        raise HTTPException(409, f"当前状态 {run.status.value} 不允许恢复")
+    if run.version != body.expected_version:
+        raise HTTPException(409, "expected_version 不匹配，请重新查询后再操作")
+    try:
+        run = await store.append_run_input(run_id, run.version, body.message)
+        if run.status != RunStatus.RUNNING:
+            run = await store.update_run_status(
+                run_id, run.version, RunStatus.RUNNING,
+                event_type="RUN_RESUMED", event_payload={"reason": "user_input"})
+    except VersionConflictError as ex:
+        raise HTTPException(409, "Run 已被修改，请重新查询后再操作") from ex
+    if _dispatch is not None:
+        await _dispatch(run_id)
+    return {"run_id": run_id, "status": run.status.value}
+
+
+@router.post("/runs/{run_id}/approval", status_code=202)
+async def decide_approval(run_id: str, body: ApprovalRequest, request: Request):
+    """审批（7.4 节）：只有任务所有者或管理员可以审批；决定不可覆盖。
+
+    approve → Run 回到 RUNNING 并调度引擎继续；reject → 安全失败路径，绝不执行退款。
+    """
+    store = _require_store()
+    run = await _load_owned_run(store, request, run_id)
+    if run.version != body.expected_version:
+        raise HTTPException(409, "expected_version 不匹配，请重新查询后再操作")
+    if run.status != RunStatus.WAITING_APPROVAL:
+        raise HTTPException(409, f"当前状态 {run.status.value} 不在等待审批")
+    approval = await store.get_approval(run_id, body.step_key)
+    if approval is None:
+        raise HTTPException(404, "审批记录不存在")
+    account = getattr(request.state, "account", None)
+    decided_by = account["user_id"] if account else "anonymous"
+    decision = (ApprovalDecision.APPROVED if body.decision == "approve"
+                else ApprovalDecision.REJECTED)
+    try:
+        await store.decide_approval(run_id, body.step_key, decision,
+                                    decided_by=decided_by, comment=body.comment or None)
+    except ApprovalAlreadyDecidedError as ex:
+        raise HTTPException(409, str(ex)) from ex
+    except ApprovalNotFoundError as ex:
+        raise HTTPException(404, str(ex)) from ex
+    try:
+        if decision == ApprovalDecision.REJECTED:
+            # 拒绝：安全失败/升级路径，不执行退款；写工具相关步骤跳过
+            # 状态机要求 WAITING_APPROVAL → RUNNING → FAILED 两步走（5.3 节）
+            try:
+                await store.update_step_status(
+                    run_id, body.step_key, StepStatus.WAITING_APPROVAL, StepStatus.FAILED,
+                    error_code="approval_rejected")
+            except (IllegalTransitionError, RuntimeError):
+                # 步骤状态异常时由引擎在重新调度后兜底处理；Run 级失败仍然生效
+                logger.warning("拒绝审批时步骤状态更新失败，交由引擎兜底: %s/%s", run_id, body.step_key)
+            run = await store.update_run_status(
+                run_id, run.version, RunStatus.RUNNING,
+                event_type="RUN_RESUMED", event_payload={"reason": "approval_rejected"})
+            run = await store.update_run_status(
+                run_id, run.version, RunStatus.FAILED,
+                error_code="approval_rejected", retryable=False,
+                response_json={"response": "退款申请未获批准，本次不执行退款。如有疑问请联系人工客服。"},
+                event_type="RUN_FAILED", event_payload={"reason": "approval_rejected"})
+            return {"run_id": run_id, "status": run.status.value, "decision": "rejected"}
+        # approve：转回 RUNNING 并调度引擎继续
+        run = await store.update_run_status(
+            run_id, run.version, RunStatus.RUNNING,
+            event_type="RUN_RESUMED", event_payload={"reason": "approval_approved"})
+        if _dispatch is not None:
+            await _dispatch(run_id)
+        return {"run_id": run_id, "status": run.status.value, "decision": "approved"}
+    except VersionConflictError as ex:
+        raise HTTPException(409, "Run 已被修改，请重新查询后再操作") from ex
+    except (IllegalTransitionError, LeaseConflictError, LeaseLostError) as ex:
+        raise HTTPException(409, str(ex)) from ex

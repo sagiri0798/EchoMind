@@ -2,7 +2,12 @@
 
 边界：与 RunStore 使用不同的数据库文件，明确"外部系统"不属于任务状态；
 查询一律校验 user_id 与订单归属，跨用户数据按不存在处理（不可见）。
-退款写入 submit_refund/get_refund_status 在 PR5 接入，表结构先行建好避免再迁移。
+
+退款写入保证：
+- operation_id 唯一（幂等键 = 业务幂等键）；
+- 相同 operation_id 重复提交返回相同退款记录；参数不同则冲突；
+- 状态阶梯 submitted → processing → succeeded/failed；
+- 故障注入只通过客户端构造参数/方法开关，生产代码路径不读取用户可控参数。
 """
 import asyncio
 import logging
@@ -12,6 +17,11 @@ from datetime import datetime
 from typing import Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# 故障注入模式（仅测试使用，10 节）
+FAIL_BEFORE_EFFECT = "FAIL_BEFORE_EFFECT"
+FAIL_AFTER_EFFECT_BEFORE_RESPONSE = "FAIL_AFTER_EFFECT_BEFORE_RESPONSE"
+DELAYED_SUCCESS = "DELAYED_SUCCESS"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
@@ -51,16 +61,40 @@ def _row_dict(row: sqlite3.Row) -> dict:
     return {key: row[key] for key in row.keys()}
 
 
-class SandboxBillingClient:
-    """沙箱账单客户端。只读查询属主隔离；写操作（PR5）将以 operation_id 幂等。"""
+class BillingUnavailable(RuntimeError):
+    """外部账单系统不可用（副作用未发生）。"""
 
-    def __init__(self, path):
+
+class BillingOutcomeUnknown(RuntimeError):
+    """外部系统可能已执行但响应丢失（副作用可能已发生）。"""
+
+    def __init__(self, operation_id: str):
+        super().__init__(f"退款提交结果未知: {operation_id}")
+        self.operation_id = operation_id
+
+
+class RefundConflictError(RuntimeError):
+    """同一 operation_id 携带不同参数重复提交。"""
+
+
+class SandboxBillingClient:
+    """沙箱账单客户端。只读查询属主隔离；写操作以 operation_id 幂等。"""
+
+    def __init__(self, path, fault_injection: Optional[str] = None):
         self._path = str(path)
+        self._fault = fault_injection
 
     @property
     def path(self) -> str:
         """数据库文件路径，便于排查与测试。"""
         return self._path
+
+    def enable_fault(self, mode: str) -> None:
+        """启用一次性故障注入（仅测试）。"""
+        self._fault = mode
+
+    def disable_fault(self) -> None:
+        self._fault = None
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -135,6 +169,79 @@ class SandboxBillingClient:
                 (order_id, user_id),
             ).fetchall()
             return [_row_dict(row) for row in rows]
+
+    # ── 退款写入（幂等）────────────────────────────────
+
+    async def submit_refund(self, order_id: str, user_id: str, amount_cents: int,
+                            reason: str, operation_id: str) -> dict:
+        """提交退款申请。同一 operation_id 重复提交返回相同记录；参数不同则冲突。"""
+        return await asyncio.to_thread(
+            self._submit_refund, order_id, user_id, amount_cents, reason, operation_id)
+
+    def _submit_refund(self, order_id, user_id, amount_cents, reason, operation_id) -> dict:
+        # 故障注入：副作用发生前失败（外部系统根本没收到）
+        if self._fault == FAIL_BEFORE_EFFECT:
+            self._fault = None
+            raise BillingUnavailable("故障注入：提交前失败（副作用未发生）")
+        with self._connect() as conn:
+            order = conn.execute(
+                "SELECT * FROM orders WHERE order_id=? AND user_id=?", (order_id, user_id)
+            ).fetchone()
+            if order is None:
+                raise RefundConflictError(f"订单不存在或不属于用户: {order_id}")
+            existing = conn.execute(
+                "SELECT * FROM refunds WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+            if existing is not None:
+                if (existing["order_id"], existing["user_id"], existing["amount_cents"]) \
+                        != (order_id, user_id, amount_cents):
+                    raise RefundConflictError("同一 operation_id 不能用于不同参数")
+                return _row_dict(existing)  # 幂等：返回相同退款记录
+            conn.execute("BEGIN IMMEDIATE")
+            now = datetime.now().isoformat()
+            status = "processing" if self._fault == DELAYED_SUCCESS else "submitted"
+            if self._fault == DELAYED_SUCCESS:
+                self._fault = None  # 一次性注入：代表外部系统处理较慢
+            conn.execute(
+                "INSERT INTO refunds (operation_id, order_id, user_id, amount_cents, reason, "
+                "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (operation_id, order_id, user_id, amount_cents, reason, status, now, now),
+            )
+            conn.execute("COMMIT")
+            record = dict(operation_id=operation_id, order_id=order_id, user_id=user_id,
+                          amount_cents=amount_cents, reason=reason, status=status,
+                          created_at=now, updated_at=now)
+        # 故障注入：副作用已发生但响应丢失（本地 checkpoint 前崩溃）
+        if self._fault == FAIL_AFTER_EFFECT_BEFORE_RESPONSE:
+            self._fault = None
+            raise BillingOutcomeUnknown(operation_id)
+        return record
+
+    async def get_refund_status(self, operation_id: str, user_id: str) -> Optional[dict]:
+        """查询退款状态（状态阶梯：submitted → processing → succeeded）。"""
+        return await asyncio.to_thread(self._get_refund_status, operation_id, user_id)
+
+    def _get_refund_status(self, operation_id: str, user_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM refunds WHERE operation_id=? AND user_id=?", (operation_id, user_id)
+            ).fetchone()
+            if row is None:
+                return None  # 未执行或不属于该用户
+            status = row["status"]
+            if status == "submitted":
+                status = "processing"
+                conn.execute(
+                    "UPDATE refunds SET status='processing', updated_at=? WHERE operation_id=?",
+                    (datetime.now().isoformat(), operation_id),
+                )
+            elif status == "processing":
+                status = "succeeded"
+                conn.execute(
+                    "UPDATE refunds SET status='succeeded', updated_at=? WHERE operation_id=?",
+                    (datetime.now().isoformat(), operation_id),
+                )
+            return dict(row) | {"status": status}
 
 
 def demo_seed() -> tuple[List[dict], List[dict]]:
