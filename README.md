@@ -663,6 +663,10 @@ core/intent_embedding.py       在线向量、本地降级与模板缓存
 core/skill_loader.py           Skills 加载和匹配
 core/access.py                 API 身份与角色校验
 memory/conversation_memory.py  Redis / ChromaDB 分层记忆
+runtime/                       任务运行时（Task-Runtime-v1，开发中）
+  models.py                    Run/Step/Approval/Event 数据模型
+  state_machine.py             合法状态转换与终态判断
+  store.py                     SQLite 持久化、版本与租约校验
 tooling/                       工具执行与标准 MCP
   tool_manager.py              缓存、超时、熔断、参数校验
   knowledge_base.py            知识库导入、切片与检索

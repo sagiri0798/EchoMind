@@ -1,0 +1,660 @@
+"""RunStore：任务运行状态的唯一事实源（SQLite）。
+
+亮点：所有状态变更都是「校验 + 更新 + 事件」的原子事务；
+版本号与租约双重校验，防止过期 runner 覆盖新状态（实施计划 11.2 节）。
+
+SQLite 打开参数：WAL、foreign_keys、busy_timeout。每个操作使用独立连接
+并通过 asyncio.to_thread 在线程池执行，避免跨线程共用连接；
+多语句写操作在 BEGIN IMMEDIATE 事务内完成。
+"""
+import asyncio
+import dataclasses
+import json
+import logging
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from typing import Any, Iterator, Optional
+
+from runtime.models import (
+    ApprovalDecision,
+    Run,
+    RunApproval,
+    RunEvent,
+    RunStatus,
+    RunStep,
+    StepStatus,
+    now_iso,
+)
+from runtime.state_machine import (
+    RUN_TERMINAL,
+    STEP_TERMINAL,
+    can_transition_run,
+    can_transition_step,
+)
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_LEASE_SECONDS = 30
+SCHEMA_VERSION = 1
+
+
+# ── 异常 ──────────────────────────────────────────────
+
+
+class StoreError(RuntimeError):
+    """Runtime 存储层错误基类。"""
+
+
+class RunNotFoundError(StoreError):
+    """Run 不存在。"""
+
+
+class DuplicateRunError(StoreError):
+    """同一 (user_id, conv_id, client_request_id) 已存在 Run。"""
+
+    def __init__(self, run_id: str):
+        super().__init__(f"同一请求键已存在 Run: {run_id}")
+        self.run_id = run_id
+
+
+class VersionConflictError(StoreError):
+    """版本号不匹配，写入被拒绝。"""
+
+
+class IllegalTransitionError(StoreError):
+    """状态转换不在合法转换表内（含 Step 的期望状态不匹配）。"""
+
+
+class LeaseConflictError(StoreError):
+    """有效租约由其他 owner 持有。"""
+
+
+class LeaseLostError(StoreError):
+    """持有者租约已过期，禁止继续提交。"""
+
+
+class StepNotFoundError(StoreError):
+    """Step 不存在。"""
+
+
+class StepExistsError(StoreError):
+    """同一 (run_id, step_key) 的 Step 已存在。"""
+
+
+class ApprovalNotFoundError(StoreError):
+    """审批记录不存在。"""
+
+
+class ApprovalAlreadyDecidedError(StoreError):
+    """审批已经决定过，不允许覆盖。"""
+
+
+# ── 表结构 ────────────────────────────────────────────
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs (
+  id                   TEXT PRIMARY KEY,
+  user_id              TEXT NOT NULL,
+  conv_id              TEXT NOT NULL,
+  client_request_id    TEXT NOT NULL,
+  message_hash         TEXT NOT NULL,
+  task_type            TEXT NOT NULL,
+  plan_version         TEXT NOT NULL,
+  status               TEXT NOT NULL,
+  current_step         TEXT,
+  context_json         TEXT,
+  input_json           TEXT,
+  result_json          TEXT,
+  response_json        TEXT,
+  error_code           TEXT,
+  retryable            INTEGER NOT NULL DEFAULT 0,
+  version              INTEGER NOT NULL DEFAULT 0,
+  lease_owner          TEXT,
+  lease_until          TEXT,
+  transcript_committed INTEGER NOT NULL DEFAULT 0,
+  created_at           TEXT NOT NULL,
+  updated_at           TEXT NOT NULL,
+  finished_at          TEXT,
+  UNIQUE(user_id, conv_id, client_request_id)
+);
+
+CREATE TABLE IF NOT EXISTS run_steps (
+  id              TEXT PRIMARY KEY,
+  run_id          TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  step_key        TEXT NOT NULL,
+  ordinal         INTEGER NOT NULL,
+  tool_name       TEXT,
+  status          TEXT NOT NULL,
+  attempt         INTEGER NOT NULL DEFAULT 0,
+  idempotency_key TEXT,
+  input_json      TEXT,
+  output_json     TEXT,
+  evidence_json   TEXT,
+  error_code      TEXT,
+  started_at      TEXT,
+  finished_at     TEXT,
+  UNIQUE(run_id, step_key)
+);
+
+CREATE TABLE IF NOT EXISTS run_approvals (
+  id           TEXT PRIMARY KEY,
+  run_id       TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  step_key     TEXT NOT NULL,
+  risk_summary TEXT NOT NULL,
+  decision     TEXT NOT NULL,
+  decided_by   TEXT,
+  comment      TEXT,
+  created_at   TEXT NOT NULL,
+  decided_at   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS run_events (
+  seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id       TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  event_type   TEXT NOT NULL,
+  step_key     TEXT,
+  payload_json TEXT NOT NULL,
+  created_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_steps_run ON run_steps(run_id);
+CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id);
+CREATE INDEX IF NOT EXISTS idx_run_approvals_run ON run_approvals(run_id);
+"""
+
+
+def _dumps(value: Optional[dict]) -> Optional[str]:
+    """dict → JSON 文本；None 保持 NULL。"""
+    return json.dumps(value, ensure_ascii=False) if value is not None else None
+
+
+def _loads(text: Optional[str]) -> Optional[dict]:
+    """JSON 文本 → dict；NULL 保持 None。"""
+    return json.loads(text) if text is not None else None
+
+
+def _run_to_row(run: Run) -> dict:
+    return {
+        "id": run.id,
+        "user_id": run.user_id,
+        "conv_id": run.conv_id,
+        "client_request_id": run.client_request_id,
+        "message_hash": run.message_hash,
+        "task_type": run.task_type,
+        "plan_version": run.plan_version,
+        "status": run.status.value,
+        "current_step": run.current_step,
+        "context_json": _dumps(run.context_json),
+        "input_json": _dumps(run.input_json),
+        "result_json": _dumps(run.result_json),
+        "response_json": _dumps(run.response_json),
+        "error_code": run.error_code,
+        "retryable": int(run.retryable),
+        "version": run.version,
+        "lease_owner": run.lease_owner,
+        "lease_until": run.lease_until,
+        "transcript_committed": int(run.transcript_committed),
+        "created_at": run.created_at,
+        "updated_at": run.updated_at,
+        "finished_at": run.finished_at,
+    }
+
+
+def _run_from_row(row: sqlite3.Row) -> Run:
+    return Run(
+        id=row["id"],
+        user_id=row["user_id"],
+        conv_id=row["conv_id"],
+        client_request_id=row["client_request_id"],
+        message_hash=row["message_hash"],
+        task_type=row["task_type"],
+        plan_version=row["plan_version"],
+        status=RunStatus(row["status"]),
+        current_step=row["current_step"],
+        context_json=_loads(row["context_json"]),
+        input_json=_loads(row["input_json"]),
+        result_json=_loads(row["result_json"]),
+        response_json=_loads(row["response_json"]),
+        error_code=row["error_code"],
+        retryable=bool(row["retryable"]),
+        version=row["version"],
+        lease_owner=row["lease_owner"],
+        lease_until=row["lease_until"],
+        transcript_committed=bool(row["transcript_committed"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        finished_at=row["finished_at"],
+    )
+
+
+def _step_to_row(step: RunStep) -> dict:
+    return {
+        "id": step.id,
+        "run_id": step.run_id,
+        "step_key": step.step_key,
+        "ordinal": step.ordinal,
+        "tool_name": step.tool_name,
+        "status": step.status.value,
+        "attempt": step.attempt,
+        "idempotency_key": step.idempotency_key,
+        "input_json": _dumps(step.input_json),
+        "output_json": _dumps(step.output_json),
+        "evidence_json": _dumps(step.evidence_json),
+        "error_code": step.error_code,
+        "started_at": step.started_at,
+        "finished_at": step.finished_at,
+    }
+
+
+def _step_from_row(row: sqlite3.Row) -> RunStep:
+    return RunStep(
+        id=row["id"],
+        run_id=row["run_id"],
+        step_key=row["step_key"],
+        ordinal=row["ordinal"],
+        tool_name=row["tool_name"],
+        status=StepStatus(row["status"]),
+        attempt=row["attempt"],
+        idempotency_key=row["idempotency_key"],
+        input_json=_loads(row["input_json"]),
+        output_json=_loads(row["output_json"]),
+        evidence_json=_loads(row["evidence_json"]),
+        error_code=row["error_code"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+    )
+
+
+def _event_from_row(row: sqlite3.Row) -> RunEvent:
+    return RunEvent(
+        seq=row["seq"],
+        run_id=row["run_id"],
+        event_type=row["event_type"],
+        step_key=row["step_key"],
+        payload_json=_loads(row["payload_json"]) or {},
+        created_at=row["created_at"],
+    )
+
+
+class RunStore:
+    """SQLite 持久化的任务状态存储。所有写操作带版本/租约校验。
+
+    接口是 async 的（与仓库其余模块一致），内部同步 sqlite3
+    操作统一通过 asyncio.to_thread 调度到线程池。
+    """
+
+    def __init__(self, path):
+        self._path = str(path)
+
+    @property
+    def path(self) -> str:
+        """数据库文件路径，便于排查与测试。"""
+        return self._path
+
+    # ── 连接管理 ──────────────────────────────────────
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """每次操作使用独立连接；isolation_level=None 后由显式 BEGIN 控制事务。"""
+        conn = sqlite3.connect(self._path, timeout=5.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def _insert_event(self, conn: sqlite3.Connection, run_id: str, event_type: str,
+                      step_key: Optional[str], payload: Optional[dict]) -> None:
+        conn.execute(
+            "INSERT INTO run_events (run_id, event_type, step_key, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (run_id, event_type, step_key, _dumps(payload or {}), now_iso()),
+        )
+
+    # ── 初始化 ────────────────────────────────────────
+
+    async def bootstrap(self) -> None:
+        """建表与索引。幂等：重复调用不报错、不影响已有数据。"""
+        await asyncio.to_thread(self._bootstrap)
+
+    def _bootstrap(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(_SCHEMA)
+            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    # ── Run 创建与读取 ────────────────────────────────
+
+    async def create_run(self, **fields: Any) -> Run:
+        """插入一个新 Run 并写入 RUN_CREATED 事件（同一事务）。"""
+        return await asyncio.to_thread(self._insert_run, Run(**fields))
+
+    def _insert_run(self, run: Run) -> Run:
+        with self._connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "INSERT INTO runs ("
+                    + ", ".join(_run_to_row(run).keys()) + ") VALUES ("
+                    + ", ".join("?" for _ in _run_to_row(run)) + ")",
+                    tuple(_run_to_row(run).values()),
+                )
+                self._insert_event(conn, run.id, "RUN_CREATED", None,
+                                   {"task_type": run.task_type, "plan_version": run.plan_version})
+                conn.execute("COMMIT")
+            except sqlite3.IntegrityError:
+                conn.execute("ROLLBACK")
+                existing = conn.execute(
+                    "SELECT id FROM runs WHERE user_id=? AND conv_id=? AND client_request_id=?",
+                    (run.user_id, run.conv_id, run.client_request_id),
+                ).fetchone()
+                if existing:
+                    raise DuplicateRunError(existing["id"]) from None
+                raise
+        return run
+
+    async def get_run(self, run_id: str) -> Run:
+        return await asyncio.to_thread(self._get_run, run_id)
+
+    def _get_run(self, run_id: str) -> Run:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                raise RunNotFoundError(f"Run 不存在: {run_id}")
+            return _run_from_row(row)
+
+    async def find_run(self, user_id: str, conv_id: str, client_request_id: str) -> Optional[Run]:
+        """按请求键查找 Run；幂等创建由 API 层用本方法配合 create_run 实现。"""
+        return await asyncio.to_thread(self._find_run, user_id, conv_id, client_request_id)
+
+    def _find_run(self, user_id: str, conv_id: str, client_request_id: str) -> Optional[Run]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM runs WHERE user_id=? AND conv_id=? AND client_request_id=?",
+                (user_id, conv_id, client_request_id),
+            ).fetchone()
+            return _run_from_row(row) if row else None
+
+    # ── Run 状态转换 ──────────────────────────────────
+
+    async def update_run_status(
+        self,
+        run_id: str,
+        expected_version: int,
+        next_status: RunStatus,
+        *,
+        current_step: Optional[str] = None,
+        lease_owner: Optional[str] = None,
+        result_json: Optional[dict] = None,
+        error_code: Optional[str] = None,
+        retryable: Optional[bool] = None,
+        event_type: Optional[str] = None,
+        event_payload: Optional[dict] = None,
+    ) -> Run:
+        """原子状态转换：校验版本、合法转换与租约后，更新状态并（可选）写事件。
+
+        进入终态时自动写 finished_at。任一校验失败整个事务回滚。
+        """
+        return await asyncio.to_thread(
+            self._update_run_status, run_id, expected_version, next_status,
+            current_step, lease_owner, result_json, error_code, retryable,
+            event_type, event_payload,
+        )
+
+    def _update_run_status(self, run_id, expected_version, next_status, current_step,
+                           lease_owner, result_json, error_code, retryable,
+                           event_type, event_payload) -> Run:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise RunNotFoundError(f"Run 不存在: {run_id}")
+            run = _run_from_row(row)
+            if run.version != expected_version:
+                conn.execute("ROLLBACK")
+                raise VersionConflictError(
+                    f"版本冲突: 期望 {expected_version}，当前 {run.version}"
+                )
+            if not can_transition_run(run.status, next_status):
+                conn.execute("ROLLBACK")
+                raise IllegalTransitionError(
+                    f"非法状态转换: {run.status.value} → {next_status.value}"
+                )
+            self._check_lease(run, lease_owner)
+            finished_at = now_iso() if next_status in RUN_TERMINAL else None
+            conn.execute(
+                "UPDATE runs SET status=?, current_step=?, result_json=?, error_code=?, "
+                "retryable=?, version=version+1, updated_at=?, finished_at=? WHERE id=?",
+                (
+                    next_status.value,
+                    current_step if current_step is not None else run.current_step,
+                    _dumps(result_json) if result_json is not None else run.result_json and _dumps(run.result_json),
+                    error_code if error_code is not None else run.error_code,
+                    int(retryable) if retryable is not None else run.retryable,
+                    now_iso(),
+                    finished_at if finished_at is not None else run.finished_at,
+                    run_id,
+                ),
+            )
+            if event_type:
+                self._insert_event(conn, run_id, event_type, current_step, event_payload)
+            conn.execute("COMMIT")
+        return dataclasses.replace(
+            run,
+            status=next_status,
+            version=run.version + 1,
+            updated_at=now_iso(),
+            finished_at=finished_at or run.finished_at,
+            current_step=current_step if current_step is not None else run.current_step,
+            result_json=result_json if result_json is not None else run.result_json,
+            error_code=error_code if error_code is not None else run.error_code,
+            retryable=retryable if retryable is not None else run.retryable,
+        )
+
+    def _check_lease(self, run: Run, lease_owner: Optional[str]) -> None:
+        """租约校验：有效租约只能由持有者提交；过期持有者提交被拒绝。"""
+        if run.lease_owner is None:
+            return
+        active = bool(run.lease_until) and datetime.fromisoformat(run.lease_until) > datetime.now()
+        if active:
+            if lease_owner != run.lease_owner:
+                raise LeaseConflictError(f"租约由 {run.lease_owner} 持有")
+            return
+        # 租约已过期：旧持有者不能再提交；其他调用方视为无有效租约
+        if lease_owner is not None and lease_owner == run.lease_owner:
+            raise LeaseLostError(f"租约已过期，持有者 {run.lease_owner} 不能继续提交")
+
+    # ── 租约 ──────────────────────────────────────────
+
+    async def try_acquire_lease(self, run_id: str, owner: str, expected_version: int,
+                                lease_s: int = DEFAULT_LEASE_SECONDS) -> Run:
+        """获取或续租。有效租约只允许持有者续租；过期/空闲租约任何 owner 可接管。"""
+        return await asyncio.to_thread(self._try_acquire_lease, run_id, owner, expected_version, lease_s)
+
+    def _try_acquire_lease(self, run_id: str, owner: str, expected_version: int, lease_s: int) -> Run:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise RunNotFoundError(f"Run 不存在: {run_id}")
+            run = _run_from_row(row)
+            if run.version != expected_version:
+                conn.execute("ROLLBACK")
+                raise VersionConflictError(
+                    f"版本冲突: 期望 {expected_version}，当前 {run.version}"
+                )
+            active = bool(run.lease_until) and datetime.fromisoformat(run.lease_until) > datetime.now()
+            if active and run.lease_owner != owner:
+                conn.execute("ROLLBACK")
+                raise LeaseConflictError(f"租约由 {run.lease_owner} 持有")
+            lease_until = (datetime.now() + timedelta(seconds=lease_s)).isoformat()
+            conn.execute(
+                "UPDATE runs SET lease_owner=?, lease_until=?, version=version+1, updated_at=? "
+                "WHERE id=?",
+                (owner, lease_until, now_iso(), run_id),
+            )
+            conn.execute("COMMIT")
+        return dataclasses.replace(run, lease_owner=owner, lease_until=lease_until,
+                                   version=run.version + 1, updated_at=now_iso())
+
+    # ── Step ──────────────────────────────────────────
+
+    async def create_steps(self, run_id: str, steps: list[RunStep]) -> None:
+        """批量插入 Plan 生成的 Step。任一重复 step_key 则整批回滚。"""
+        await asyncio.to_thread(self._insert_steps, run_id, steps)
+
+    def _insert_steps(self, run_id: str, steps: list[RunStep]) -> None:
+        with self._connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for step in steps:
+                    step = dataclasses.replace(step, run_id=run_id)  # 统一填充归属 Run
+                    conn.execute(
+                        "INSERT INTO run_steps (" + ", ".join(_step_to_row(step).keys())
+                        + ") VALUES (" + ", ".join("?" for _ in _step_to_row(step)) + ")",
+                        tuple(_step_to_row(step).values()),
+                    )
+                conn.execute("COMMIT")
+            except sqlite3.IntegrityError:
+                conn.execute("ROLLBACK")
+                raise StepExistsError(f"Run {run_id} 中 Step 已存在") from None
+
+    async def get_steps(self, run_id: str) -> list[RunStep]:
+        """按 ordinal 升序返回全部 Step。"""
+        return await asyncio.to_thread(self._get_steps, run_id)
+
+    def _get_steps(self, run_id: str) -> list[RunStep]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM run_steps WHERE run_id=? ORDER BY ordinal ASC", (run_id,)
+            ).fetchall()
+            return [_step_from_row(row) for row in rows]
+
+    async def get_step(self, run_id: str, step_key: str) -> RunStep:
+        return await asyncio.to_thread(self._get_step, run_id, step_key)
+
+    def _get_step(self, run_id: str, step_key: str) -> RunStep:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM run_steps WHERE run_id=? AND step_key=?", (run_id, step_key)
+            ).fetchone()
+            if row is None:
+                raise StepNotFoundError(f"Step 不存在: {run_id}/{step_key}")
+            return _step_from_row(row)
+
+    async def update_step_status(
+        self,
+        run_id: str,
+        step_key: str,
+        expected_status: StepStatus,
+        next_status: StepStatus,
+        *,
+        attempt: Optional[int] = None,
+        output_json: Optional[dict] = None,
+        evidence_json: Optional[dict] = None,
+        error_code: Optional[str] = None,
+        event_type: Optional[str] = None,
+        event_payload: Optional[dict] = None,
+    ) -> RunStep:
+        """Step 状态转换：期望状态不匹配（CAS）或转换非法时拒绝，事务回滚。"""
+        return await asyncio.to_thread(
+            self._update_step_status, run_id, step_key, expected_status, next_status,
+            attempt, output_json, evidence_json, error_code, event_type, event_payload,
+        )
+
+    def _update_step_status(self, run_id, step_key, expected_status, next_status, attempt,
+                            output_json, evidence_json, error_code, event_type, event_payload) -> RunStep:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM run_steps WHERE run_id=? AND step_key=?", (run_id, step_key)
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise StepNotFoundError(f"Step 不存在: {run_id}/{step_key}")
+            step = _step_from_row(row)
+            if step.status != expected_status:
+                conn.execute("ROLLBACK")
+                raise IllegalTransitionError(
+                    f"Step 状态冲突: 期望 {expected_status.value}，当前 {step.status.value}"
+                )
+            if not can_transition_step(expected_status, next_status):
+                conn.execute("ROLLBACK")
+                raise IllegalTransitionError(
+                    f"非法 Step 转换: {expected_status.value} → {next_status.value}"
+                )
+            # 进入 RUNNING 时打开始时间；此后保持不变
+            started_at = now_iso() if next_status == StepStatus.RUNNING and step.started_at is None \
+                else step.started_at
+            finished_at = now_iso() if next_status in STEP_TERMINAL else None
+            conn.execute(
+                "UPDATE run_steps SET status=?, attempt=?, output_json=?, evidence_json=?, "
+                "error_code=?, started_at=?, finished_at=? "
+                "WHERE run_id=? AND step_key=?",
+                (
+                    next_status.value,
+                    attempt if attempt is not None else step.attempt,
+                    _dumps(output_json) if output_json is not None else step.output_json and _dumps(step.output_json),
+                    _dumps(evidence_json) if evidence_json is not None else step.evidence_json and _dumps(step.evidence_json),
+                    error_code if error_code is not None else step.error_code,
+                    started_at,
+                    finished_at if finished_at is not None else step.finished_at,
+                    run_id,
+                    step_key,
+                ),
+            )
+            if event_type:
+                self._insert_event(conn, run_id, event_type, step_key, event_payload)
+            conn.execute("COMMIT")
+        return dataclasses.replace(
+            step,
+            status=next_status,
+            attempt=attempt if attempt is not None else step.attempt,
+            output_json=output_json if output_json is not None else step.output_json,
+            evidence_json=evidence_json if evidence_json is not None else step.evidence_json,
+            error_code=error_code if error_code is not None else step.error_code,
+            started_at=started_at,
+            finished_at=finished_at or step.finished_at,
+        )
+
+    # ── 事件 ──────────────────────────────────────────
+
+    async def record_event(self, run_id: str, event_type: str, *,
+                           step_key: Optional[str] = None,
+                           payload: Optional[dict] = None) -> RunEvent:
+        """追加一条审计事件。seq 由 SQLite 自增分配。"""
+        return await asyncio.to_thread(self._record_event, run_id, event_type, step_key, payload)
+
+    def _record_event(self, run_id: str, event_type: str, step_key: Optional[str],
+                      payload: Optional[dict]) -> RunEvent:
+        created_at = now_iso()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO run_events (run_id, event_type, step_key, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (run_id, event_type, step_key, _dumps(payload or {}), created_at),
+            )
+            return RunEvent(
+                seq=cursor.lastrowid, run_id=run_id, event_type=event_type,
+                step_key=step_key, payload_json=payload or {}, created_at=created_at,
+            )
+
+    async def get_events(self, run_id: str, *, limit: Optional[int] = None,
+                         offset: int = 0) -> list[RunEvent]:
+        """按 seq 升序返回事件（追加式日志的天然顺序）。"""
+        return await asyncio.to_thread(self._get_events, run_id, limit, offset)
+
+    def _get_events(self, run_id: str, limit: Optional[int], offset: int) -> list[RunEvent]:
+        sql = "SELECT * FROM run_events WHERE run_id=? ORDER BY seq ASC"
+        params: list = [run_id]
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params += [limit, offset]
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [_event_from_row(row) for row in rows]
