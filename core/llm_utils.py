@@ -1,5 +1,18 @@
 """LLM response helpers shared by Anthropic-compatible providers."""
-from typing import Any, Iterable, List
+import os
+from typing import Any, Dict, Iterable, List
+
+
+def llm_extra_kwargs() -> Dict[str, Any]:
+    """Provider-specific request options for Anthropic-compatible APIs.
+
+    DeepSeek v4 等推理模型默认返回 thinking 块：既消耗输出 token，也会让
+    短 JSON 调用在 token 上限内拿不到正文。设置 ECHOMIND_DISABLE_THINKING=true
+    可显式请求纯文本输出；默认关闭该选项，保持官方 Anthropic 行为不变。
+    """
+    if os.getenv("ECHOMIND_DISABLE_THINKING", "false").lower() in {"1", "true", "yes"}:
+        return {"extra_body": {"thinking": {"type": "disabled"}}}
+    return {}
 
 
 def extract_text_content(content: Iterable[Any], separator: str = "\n") -> str:

@@ -26,6 +26,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
+# Windows 控制台/重定向的默认编码可能是 GBK，统一为 UTF-8，
+# 避免启动横幅和中文日志触发 UnicodeEncodeError 导致服务无法启动。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 load_dotenv()
 
 logging.basicConfig(

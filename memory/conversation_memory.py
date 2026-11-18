@@ -28,7 +28,7 @@ import redis.asyncio as redis
 from redis.exceptions import WatchError
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import extract_text_content, llm_extra_kwargs
 from core.concurrency import KeyedLocks, redis_lease
 
 logger = logging.getLogger(__name__)
@@ -257,6 +257,7 @@ class MemoryManager:
             resp = await asyncio.wait_for(self._client.messages.create(
                 model=self._model, max_tokens=512, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
+                **llm_extra_kwargs(),
             ), timeout=15)
             raw = extract_text_content(resp.content)
             s, e = raw.find("{"), raw.rfind("}") + 1
@@ -345,6 +346,7 @@ class MemoryManager:
             resp = await self._client.messages.create(
                 model=self._model, max_tokens=1024, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
+                **llm_extra_kwargs(),
             )
             summary = self._safe_text(extract_text_content(resp.content)).strip()
             if not summary or getattr(resp, "stop_reason", None) == "max_tokens":
@@ -568,6 +570,7 @@ class MemoryManager:
                 max_tokens=256,
                 temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
+                **llm_extra_kwargs(),
             )
             merged = self._safe_text(extract_text_content(resp.content)).strip()
             if merged:

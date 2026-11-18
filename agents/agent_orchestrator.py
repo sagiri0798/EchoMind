@@ -39,7 +39,7 @@ from agents.tools import (
     technical_tools,
 )
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
-from core.llm_utils import extract_text_content
+from core.llm_utils import extract_text_content, llm_extra_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +345,7 @@ class BaseAgent:
                     "temperature": self.profile.temperature,
                     "system": self._build_system_prompt(req),
                     "messages": messages,
+                    **llm_extra_kwargs(),
                 }
                 if tools:
                     request_kwargs["tools"] = [
@@ -708,6 +709,7 @@ class ResponseComposer:
                 max_tokens=_env_int("ECHOMIND_COMPOSER_MAX_TOKENS", 1000),
                 temperature=_env_float("ECHOMIND_COMPOSER_TEMPERATURE", 0.1),
                 messages=[{"role": "user", "content": prompt}],
+                **llm_extra_kwargs(),
             ), timeout=max(1, _env_float("ECHOMIND_COMPOSER_TIMEOUT_S", 8)))
             content = extract_text_content(response.content).strip()
             if content:

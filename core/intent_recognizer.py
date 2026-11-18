@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import extract_text_content, llm_extra_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +281,7 @@ class IntentRecognizer:
                 max_tokens=256,
                 temperature=0.1,
                 messages=[{"role": "user", "content": prompt}],
+                **llm_extra_kwargs(),
             ), timeout=max(0.1, float(os.getenv("ECHOMIND_INTENT_TIMEOUT_S", "8"))))
             raw = extract_text_content(resp.content)
             s, e = raw.find("{"), raw.rfind("}") + 1

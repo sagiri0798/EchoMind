@@ -181,6 +181,7 @@ docker compose --env-file ../EchoMind/.env up -d --build
 | `ANTHROPIC_API_KEY` | 必填，聊天、意图 LLM、摘要和 Judge 等使用的模型服务 Key。 |
 | `ANTHROPIC_BASE_URL` | Anthropic 兼容接口地址；留空时使用官方服务。 |
 | `ANTHROPIC_MODEL` | 当前服务支持的模型 ID，建议显式填写。 |
+| `ECHOMIND_DISABLE_THINKING` | 设为 `true` 时向兼容接口发送 `thinking.type=disabled`，适用于 DeepSeek v4 等默认输出 thinking 块的模型；可降低延迟并保证短 JSON 调用稳定，默认 `false`。 |
 | `REDIS_PASSWORD` | Compose 创建 Redis 时使用的密码。 |
 | `REDIS_URL` | 应用连接地址；根目录 Compose 根据 `REDIS_PASSWORD` 覆盖为容器网络地址。 |
 | `CHROMA_HOST` / `CHROMA_PORT` | Docker 使用 `chromadb:8000`；宿主机开发使用 `localhost:8001`。 |
@@ -522,6 +523,14 @@ python -m pip install -r requirements.txt
 ```
 
 Windows 可使用 `py -3.12 -m venv .venv`，然后执行 `.venv\Scripts\Activate.ps1`。
+
+> **Windows 原生安装注意**：`chromadb==0.5.23` 依赖的 `chroma-hnswlib==0.7.6` 没有提供 cp312/cp313 的 Windows 预编译包，使用 Python 3.12/3.13 会在安装阶段要求 MSVC Build Tools。本机改用 **Python 3.11**（cp311 有官方 wheel）创建 `.venv` 即可正常安装，已验证 3.11.17。
+>
+> 本机环境已配置为 Redis `localhost:6379` + ChromaDB 本地嵌入式降级，`.env` 中 `REDIS_URL`、`CHROMA_HOST`、`CHROMA_PERSIST_DIRECTORY` 均已改为本机地址；Docker 部署所需的容器地址由 `docker-compose.yml` 覆盖。启动命令：
+>
+> ```powershell
+> .\.venv\Scripts\python.exe -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+> ```
 
 只用 Docker 启动存储服务：
 

@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import extract_text_content, llm_extra_kwargs
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer
 from evaluation.few_shot import JUDGE_FEW_SHOT_EXAMPLES, JUDGE_FEW_SHOT_VERSION
@@ -197,6 +197,7 @@ Agent 响应: {response}
                 resp = await asyncio.wait_for(self._client.messages.create(
                     model=self._model, max_tokens=budget, temperature=0.0,
                     messages=[{"role": "user", "content": request_prompt}],
+                    **llm_extra_kwargs(),
                 ), timeout=self._timeout)
                 stop_reason = getattr(resp, "stop_reason", None)
                 if stop_reason == "max_tokens":

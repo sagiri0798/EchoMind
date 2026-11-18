@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import extract_text_content, llm_extra_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +327,7 @@ class MCPToolManager:
             resp = await asyncio.wait_for(self._client.messages.create(
                 model=self._model, max_tokens=512, temperature=0.3,
                 messages=[{"role": "user", "content": prompt}],
+                **llm_extra_kwargs(),
             ), timeout=10)
             raw = extract_text_content(resp.content)
             s, e = raw.find("["), raw.rfind("]") + 1
@@ -416,6 +417,7 @@ class MCPToolManager:
             resp = await asyncio.wait_for(self._client.messages.create(
                 model=self._model, max_tokens=2048, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
+                **llm_extra_kwargs(),
             ), timeout=30)
             if getattr(resp, "stop_reason", None) == "max_tokens":
                 raise ValueError("重排输出被截断")
