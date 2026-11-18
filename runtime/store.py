@@ -95,6 +95,9 @@ class ApprovalAlreadyDecidedError(StoreError):
     """审批已经决定过，不允许覆盖。"""
 
 
+REJECTED_ANSWER = "退款申请未获批准，本次不执行退款。如有疑问请联系人工客服。"
+
+
 # ── 表结构 ────────────────────────────────────────────
 
 _SCHEMA = """
@@ -337,6 +340,33 @@ class RunStore:
             (run_id, event_type, step_key, _dumps(payload or {}), now_iso()),
         )
 
+    def _load_run_for_write(self, conn: sqlite3.Connection, run_id: str) -> Run:
+        """写事务样板：加载 Run；不存在则回滚并抛错（A2 提取共享）。"""
+        row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if row is None:
+            conn.execute("ROLLBACK")
+            raise RunNotFoundError(f"Run 不存在: {run_id}")
+        return _run_from_row(row)
+
+    def _require_version(self, conn: sqlite3.Connection, run_id: str, run: Run,
+                         expected_version: int, target: str) -> None:
+        """写事务样板：版本校验；不匹配则回滚、写拒绝事件并抛错（A2 提取共享）。"""
+        if run.version != expected_version:
+            conn.execute("ROLLBACK")
+            self._record_rejection(conn, run_id, None, {
+                "from": run.status.value, "to": target,
+                "reason": "version_conflict",
+                "expected_version": expected_version, "current_version": run.version})
+            raise VersionConflictError(f"版本冲突: 期望 {expected_version}，当前 {run.version}")
+
+    def _record_rejection(self, conn: sqlite3.Connection, run_id: str, step_key: Optional[str],
+                          payload: dict) -> None:
+        """5.3 节：非法转换/版本冲突被拒绝时也写入 Event（ROLLBACK 后独立落库，审计可追溯）。"""
+        try:
+            self._insert_event(conn, run_id, "TRANSITION_REJECTED", step_key, payload)
+        except Exception:
+            logger.warning("拒绝事件写入失败: %s", run_id, exc_info=True)
+
     # ── 初始化 ────────────────────────────────────────
 
     async def bootstrap(self) -> None:
@@ -366,14 +396,15 @@ class RunStore:
         return await asyncio.to_thread(self._insert_run, Run(**fields))
 
     def _insert_run(self, run: Run) -> Run:
+        row_values = _run_to_row(run)  # A3：单次构造行值
         with self._connect() as conn:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
                     "INSERT INTO runs ("
-                    + ", ".join(_run_to_row(run).keys()) + ") VALUES ("
-                    + ", ".join("?" for _ in _run_to_row(run)) + ")",
-                    tuple(_run_to_row(run).values()),
+                    + ", ".join(row_values.keys()) + ") VALUES ("
+                    + ", ".join("?" for _ in row_values) + ")",
+                    tuple(row_values.values()),
                 )
                 self._insert_event(conn, run.id, "RUN_CREATED", None,
                                    {"task_type": run.task_type, "plan_version": run.plan_version})
@@ -443,18 +474,13 @@ class RunStore:
                            event_type, event_payload) -> Run:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-            if row is None:
-                conn.execute("ROLLBACK")
-                raise RunNotFoundError(f"Run 不存在: {run_id}")
-            run = _run_from_row(row)
-            if run.version != expected_version:
-                conn.execute("ROLLBACK")
-                raise VersionConflictError(
-                    f"版本冲突: 期望 {expected_version}，当前 {run.version}"
-                )
+            run = self._load_run_for_write(conn, run_id)
+            self._require_version(conn, run_id, run, expected_version, next_status.value)
             if not can_transition_run(run.status, next_status):
                 conn.execute("ROLLBACK")
+                self._record_rejection(conn, run_id, None, {
+                    "from": run.status.value, "to": next_status.value,
+                    "reason": "illegal_transition"})
                 raise IllegalTransitionError(
                     f"非法状态转换: {run.status.value} → {next_status.value}"
                 )
@@ -515,16 +541,8 @@ class RunStore:
     def _try_acquire_lease(self, run_id: str, owner: str, expected_version: int, lease_s: int) -> Run:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-            if row is None:
-                conn.execute("ROLLBACK")
-                raise RunNotFoundError(f"Run 不存在: {run_id}")
-            run = _run_from_row(row)
-            if run.version != expected_version:
-                conn.execute("ROLLBACK")
-                raise VersionConflictError(
-                    f"版本冲突: 期望 {expected_version}，当前 {run.version}"
-                )
+            run = self._load_run_for_write(conn, run_id)
+            self._require_version(conn, run_id, run, expected_version, "lease")
             active = bool(run.lease_until) and datetime.fromisoformat(run.lease_until) > datetime.now()
             if active and run.lease_owner != owner:
                 conn.execute("ROLLBACK")
@@ -548,16 +566,8 @@ class RunStore:
     def _append_run_input(self, run_id: str, expected_version: int, message: str) -> Run:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-            if row is None:
-                conn.execute("ROLLBACK")
-                raise RunNotFoundError(f"Run 不存在: {run_id}")
-            run = _run_from_row(row)
-            if run.version != expected_version:
-                conn.execute("ROLLBACK")
-                raise VersionConflictError(
-                    f"版本冲突: 期望 {expected_version}，当前 {run.version}"
-                )
+            run = self._load_run_for_write(conn, run_id)
+            self._require_version(conn, run_id, run, expected_version, "resume")
             updated_input = dict(run.input_json or {})
             updated_input.setdefault("supplements", []).append(message)
             conn.execute(
@@ -581,6 +591,17 @@ class RunStore:
             ).fetchall()
             return [_run_from_row(row) for row in rows]
 
+    async def list_uncommitted_succeeded(self) -> list[Run]:
+        """返回 SUCCEEDED 但会话尚未提交的 Run（11.4 节恢复检查）。"""
+        return await asyncio.to_thread(self._list_uncommitted_succeeded)
+
+    def _list_uncommitted_succeeded(self) -> list[Run]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM runs WHERE status='SUCCEEDED' AND transcript_committed=0"
+            ).fetchall()
+            return [_run_from_row(row) for row in rows]
+
     # ── 会话提交标记 ──────────────────────────────────
 
     async def mark_transcript_committed(self, run_id: str, expected_version: int) -> Run:
@@ -590,16 +611,8 @@ class RunStore:
     def _mark_transcript_committed(self, run_id: str, expected_version: int) -> Run:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-            if row is None:
-                conn.execute("ROLLBACK")
-                raise RunNotFoundError(f"Run 不存在: {run_id}")
-            run = _run_from_row(row)
-            if run.version != expected_version:
-                conn.execute("ROLLBACK")
-                raise VersionConflictError(
-                    f"版本冲突: 期望 {expected_version}，当前 {run.version}"
-                )
+            run = self._load_run_for_write(conn, run_id)
+            self._require_version(conn, run_id, run, expected_version, "transcript_committed")
             conn.execute(
                 "UPDATE runs SET transcript_committed=1, version=version+1, updated_at=? WHERE id=?",
                 (now_iso(), run_id),
@@ -621,18 +634,13 @@ class RunStore:
     def _request_cancel(self, run_id: str, expected_version: int) -> Run:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-            if row is None:
-                conn.execute("ROLLBACK")
-                raise RunNotFoundError(f"Run 不存在: {run_id}")
-            run = _run_from_row(row)
-            if run.version != expected_version:
-                conn.execute("ROLLBACK")
-                raise VersionConflictError(
-                    f"版本冲突: 期望 {expected_version}，当前 {run.version}"
-                )
+            run = self._load_run_for_write(conn, run_id)
+            self._require_version(conn, run_id, run, expected_version, "cancel_requested")
             if run.status != RunStatus.RUNNING:
                 conn.execute("ROLLBACK")
+                self._record_rejection(conn, run_id, None, {
+                    "from": run.status.value, "to": "cancel_requested",
+                    "reason": "illegal_transition"})
                 raise IllegalTransitionError(
                     f"仅 RUNNING 状态支持取消标记，当前 {run.status.value}"
                 )
@@ -655,16 +663,8 @@ class RunStore:
     def _release_lease(self, run_id: str, expected_version: int) -> Run:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-            if row is None:
-                conn.execute("ROLLBACK")
-                raise RunNotFoundError(f"Run 不存在: {run_id}")
-            run = _run_from_row(row)
-            if run.version != expected_version:
-                conn.execute("ROLLBACK")
-                raise VersionConflictError(
-                    f"版本冲突: 期望 {expected_version}，当前 {run.version}"
-                )
+            run = self._load_run_for_write(conn, run_id)
+            self._require_version(conn, run_id, run, expected_version, "lease_release")
             conn.execute(
                 "UPDATE runs SET lease_owner=NULL, lease_until=NULL, version=version+1, "
                 "updated_at=? WHERE id=?",
@@ -758,11 +758,17 @@ class RunStore:
             step = _step_from_row(row)
             if step.status != expected_status:
                 conn.execute("ROLLBACK")
+                self._record_rejection(conn, run_id, step_key, {
+                    "from": step.status.value, "to": next_status.value,
+                    "reason": "status_conflict", "expected": expected_status.value})
                 raise IllegalTransitionError(
                     f"Step 状态冲突: 期望 {expected_status.value}，当前 {step.status.value}"
                 )
             if not can_transition_step(expected_status, next_status):
                 conn.execute("ROLLBACK")
+                self._record_rejection(conn, run_id, step_key, {
+                    "from": expected_status.value, "to": next_status.value,
+                    "reason": "illegal_transition"})
                 raise IllegalTransitionError(
                     f"非法 Step 转换: {expected_status.value} → {next_status.value}"
                 )
@@ -867,9 +873,100 @@ class RunStore:
     async def decide_approval(self, run_id: str, step_key: str, decision: ApprovalDecision,
                               decided_by: Optional[str] = None,
                               comment: Optional[str] = None) -> RunApproval:
-        """审批决定只允许一次：重复决定抛 ApprovalAlreadyDecidedError（不可覆盖）。"""
+        """审批决定只允许一次：重复决定抛 ApprovalAlreadyDecidedError（不可覆盖）。
+
+        注意：本方法只写审批记录；需要同时转换 Run 状态的调用方
+        应使用 decide_approval_with_consequences（P0-2 原子性）。
+        """
         return await asyncio.to_thread(
             self._decide_approval, run_id, step_key, decision, decided_by, comment)
+
+    async def decide_approval_with_consequences(
+        self, run_id: str, step_key: str, decision: ApprovalDecision,
+        decided_by: Optional[str], comment: Optional[str],
+        expected_version: int, lease_owner: Optional[str] = None,
+    ) -> Run:
+        """单个事务：审批决定 + Run 状态转换 + 事件（P0-2）。
+
+        approve：Run WAITING_APPROVAL → RUNNING（引擎继续执行审批门）；
+        reject：审批步 FAILED、退款步骤 SKIPPED、Run 经 RUNNING 到 FAILED，
+        全部在同一 BEGIN IMMEDIATE 事务内完成，不存在"决定已提交但状态悬空"的中间态。
+        """
+        return await asyncio.to_thread(
+            self._decide_approval_with_consequences, run_id, step_key, decision,
+            decided_by, comment, expected_version, lease_owner)
+
+    def _decide_approval_with_consequences(self, run_id, step_key, decision, decided_by,
+                                           comment, expected_version, lease_owner) -> Run:
+        from runtime.plans import StepKey  # 延迟导入避免循环依赖
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = self._load_run_for_write(conn, run_id)
+            self._require_version(conn, run_id, run, expected_version,
+                                  f"approval_{decision.value}")
+            if run.status != RunStatus.WAITING_APPROVAL:
+                conn.execute("ROLLBACK")
+                self._record_rejection(conn, run_id, step_key, {
+                    "from": run.status.value, "to": f"approval_{decision.value}",
+                    "reason": "illegal_transition"})
+                raise IllegalTransitionError(
+                    f"审批决定需要 WAITING_APPROVAL，当前 {run.status.value}")
+            self._check_lease(run, lease_owner)
+            row = conn.execute(
+                "SELECT * FROM run_approvals WHERE run_id=? AND step_key=?",
+                (run_id, step_key)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise ApprovalNotFoundError(f"审批不存在: {run_id}/{step_key}")
+            approval = _approval_from_row(row)
+            if approval.decision != ApprovalDecision.PENDING:
+                conn.execute("ROLLBACK")
+                raise ApprovalAlreadyDecidedError(
+                    f"审批已决定为 {approval.decision.value}，不可覆盖")
+            decided_at = now_iso()
+            conn.execute(
+                "UPDATE run_approvals SET decision=?, decided_by=?, comment=?, decided_at=? "
+                "WHERE id=?", (decision.value, decided_by, comment, decided_at, approval.id))
+            self._insert_event(conn, run_id, "APPROVAL_DECIDED", step_key,
+                               {"decision": decision.value, "decided_by": decided_by})
+            if decision == ApprovalDecision.REJECTED:
+                # 拒绝后果同事务完成（与 approval.apply_rejected 语义一致）
+                gate = conn.execute(
+                    "SELECT * FROM run_steps WHERE run_id=? AND step_key=?",
+                    (run_id, step_key)).fetchone()
+                if gate is not None and _step_from_row(gate).status == StepStatus.WAITING_APPROVAL:
+                    conn.execute(
+                        "UPDATE run_steps SET status='FAILED', error_code='approval_rejected', "
+                        "finished_at=? WHERE run_id=? AND step_key=?",
+                        (now_iso(), run_id, step_key))
+                for key in (StepKey.SUBMIT_REFUND, StepKey.POLL_REFUND_STATUS,
+                            StepKey.BUILD_FINAL_ANSWER):
+                    conn.execute(
+                        "UPDATE run_steps SET status='SKIPPED' WHERE run_id=? AND step_key=? "
+                        "AND status='PENDING'", (run_id, key.value))
+                # 镜像状态机两步走（WAITING_APPROVAL → RUNNING → FAILED），但在同一事务内
+                conn.execute(
+                    "UPDATE runs SET status='RUNNING', version=version+1, updated_at=? "
+                    "WHERE id=?", (now_iso(), run_id))
+                conn.execute(
+                    "UPDATE runs SET status='FAILED', error_code='approval_rejected', "
+                    "retryable=0, response_json=?, version=version+1, updated_at=?, finished_at=? "
+                    "WHERE id=?",
+                    (_dumps({"response": REJECTED_ANSWER}), now_iso(), now_iso(), run_id))
+                self._insert_event(conn, run_id, "RUN_FAILED", None,
+                                   {"reason": "approval_rejected"})
+                conn.execute("COMMIT")
+                return _run_from_row(
+                    conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+            # approved：WAITING_APPROVAL → RUNNING，引擎继续执行审批门
+            conn.execute(
+                "UPDATE runs SET status='RUNNING', version=version+1, updated_at=? WHERE id=?",
+                (now_iso(), run_id))
+            self._insert_event(conn, run_id, "RUN_RESUMED", None,
+                               {"reason": "approval_approved"})
+            conn.execute("COMMIT")
+            return _run_from_row(
+                conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
 
     def _decide_approval(self, run_id, step_key, decision, decided_by, comment) -> RunApproval:
         with self._connect() as conn:
@@ -897,6 +994,73 @@ class RunStore:
             conn.execute("COMMIT")
         return dataclasses.replace(approval, decision=decision, decided_by=decided_by,
                                    comment=comment, decided_at=decided_at)
+
+    async def request_approval_atomic(self, run_id: str, step_key: str, risk_summary: str,
+                                      expected_version: int,
+                                      lease_owner: Optional[str] = None) -> Run:
+        """单个事务：创建审批（幂等）+ 审批步 → WAITING_APPROVAL + Run → WAITING_APPROVAL + 事件。
+
+        P0-1：审批创建、Step 等待态与 Run 等待态原子提交，不存在
+        "审批已创建但 Step/Run 未切换"的崩溃窗口。
+        """
+        return await asyncio.to_thread(
+            self._request_approval_atomic, run_id, step_key, risk_summary,
+            expected_version, lease_owner)
+
+    def _request_approval_atomic(self, run_id, step_key, risk_summary, expected_version,
+                                 lease_owner) -> Run:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = self._load_run_for_write(conn, run_id)
+            self._require_version(conn, run_id, run, expected_version, "waiting_approval")
+            if not can_transition_run(run.status, RunStatus.WAITING_APPROVAL):
+                conn.execute("ROLLBACK")
+                self._record_rejection(conn, run_id, step_key, {
+                    "from": run.status.value, "to": RunStatus.WAITING_APPROVAL.value,
+                    "reason": "illegal_transition"})
+                raise IllegalTransitionError(
+                    f"非法状态转换: {run.status.value} → {RunStatus.WAITING_APPROVAL.value}")
+            self._check_lease(run, lease_owner)
+            existing = conn.execute(
+                "SELECT id FROM run_approvals WHERE run_id=? AND step_key=?",
+                (run_id, step_key)).fetchone()
+            if existing is None:
+                approval = RunApproval(run_id=run_id, step_key=step_key,
+                                       risk_summary=risk_summary)
+                conn.execute(
+                    "INSERT INTO run_approvals (id, run_id, step_key, risk_summary, decision, "
+                    "decided_by, comment, created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (approval.id, approval.run_id, approval.step_key, approval.risk_summary,
+                     approval.decision.value, approval.decided_by, approval.comment,
+                     approval.created_at, approval.decided_at))
+            step_row = conn.execute(
+                "SELECT * FROM run_steps WHERE run_id=? AND step_key=?", (run_id, step_key)
+            ).fetchone()
+            if step_row is None:
+                conn.execute("ROLLBACK")
+                raise StepNotFoundError(f"Step 不存在: {run_id}/{step_key}")
+            step_status = _step_from_row(step_row).status
+            if step_status == StepStatus.RUNNING:
+                conn.execute(
+                    "UPDATE run_steps SET status='WAITING_APPROVAL', finished_at=NULL "
+                    "WHERE run_id=? AND step_key=?", (run_id, step_key))
+            elif step_status != StepStatus.WAITING_APPROVAL:
+                conn.execute("ROLLBACK")
+                self._record_rejection(conn, run_id, step_key, {
+                    "from": step_status.value, "to": StepStatus.WAITING_APPROVAL.value,
+                    "reason": "illegal_transition"})
+                raise IllegalTransitionError(
+                    f"非法 Step 转换: {step_status.value} → {StepStatus.WAITING_APPROVAL.value}")
+            conn.execute(
+                "UPDATE runs SET status='WAITING_APPROVAL', current_step=?, "
+                "version=version+1, updated_at=? WHERE id=?",
+                (step_key, now_iso(), run_id))
+            self._insert_event(conn, run_id, "APPROVAL_REQUESTED", step_key, {})
+            self._insert_event(conn, run_id, "WAITING_APPROVAL", None,
+                               {"step": step_key})
+            conn.execute("COMMIT")
+            return _run_from_row(
+                conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
 
     async def get_approvals(self, run_id: str) -> list[RunApproval]:
         """按创建顺序返回全部审批记录。创建/决定方法在 PR5 实现。"""

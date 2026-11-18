@@ -1,4 +1,5 @@
 """TaskRecovery 回归：进程重启后的扫描、对账与不重复退款（13.2 节 #7-#10）。"""
+import asyncio
 import sqlite3
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -186,3 +187,177 @@ async def test_rejected_approval_never_submits_refund(tmp_path):
     assert refund_count(env.billing) == 0
     for key in ("SUBMIT_REFUND", "POLL_REFUND_STATUS", "BUILD_FINAL_ANSWER"):
         assert (await env.store.get_step(run.id, key)).status == StepStatus.SKIPPED
+
+
+# ── 写工具「收到响应但检查点写入前崩溃」（S8/#8）──────────
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_loss_after_response_recovers_without_duplicate(tmp_path):
+    """S8 引擎侧模拟：submit_refund 响应成功、但 Step 检查点写入崩溃。"""
+    from runtime.billing import FAIL_AFTER_RESPONSE_BEFORE_CHECKPOINT
+    env = await make_env(tmp_path, fault_mode=FAIL_AFTER_RESPONSE_BEFORE_CHECKPOINT)
+    run = await advance_to_waiting_approval(env)
+    await approve(env, run)
+    # 账单侧：记录已写入（响应后崩溃的注入同样抛 BillingOutcomeUnknown）
+    await env.engine.run(run.id)
+    run = await env.store.get_run(run.id)
+    assert run.status == RunStatus.OUTCOME_UNKNOWN
+    assert refund_count(env.billing) == 1
+
+    expire_lease(env.store.path, run.id)
+    recovered = await TaskRecovery(env.store, env.billing).scan()
+    assert run.id in recovered
+    await env.engine.run(run.id)
+    final = await env.store.get_run(run.id)
+    assert final.status == RunStatus.SUCCEEDED
+    assert refund_count(env.billing) == 1  # 对账后不重复退款
+
+
+# ── 审批崩溃窗口（P0-1：审批创建后、Step/Run 切换前崩溃）──
+
+
+@pytest.mark.asyncio
+async def test_crash_after_approval_created_never_executes_refund(tmp_path):
+    """审批记录已创建、审批步尚未进入 WAITING_APPROVAL 时崩溃：恢复后必须回到等待态。"""
+    env = await make_env(tmp_path)
+    run = await advance_to_waiting_approval(env)  # 正常路径已到等待审批（含完整 DAG）
+    # 构造崩溃窗口：审批改回 pending、审批步改回 RUNNING（直接 SQL 模拟脏状态）
+    conn = sqlite3.connect(env.store.path)
+    conn.execute("UPDATE run_approvals SET decision='pending', decided_at=NULL "
+                 "WHERE run_id=?", (run.id,))
+    conn.execute("UPDATE run_steps SET status='RUNNING' WHERE run_id=? AND step_key='APPROVAL_GATE'",
+                 (run.id,))
+    conn.execute("UPDATE runs SET status='RUNNING' WHERE id=?", (run.id,))
+    conn.commit()
+    conn.close()
+    expire_lease(env.store.path, run.id)
+
+    recovered = await TaskRecovery(env.store, env.billing).scan()
+    assert run.id in recovered
+    await env.engine.run(run.id)
+
+    final = await env.store.get_run(run.id)
+    # P0-1：pending 绝不能被当作 approved——必须回到等待审批，退款零执行
+    assert final.status == RunStatus.WAITING_APPROVAL
+    assert refund_count(env.billing) == 0
+    assert (await env.store.get_step(run.id, "SUBMIT_REFUND")).status == StepStatus.PENDING
+    approval = await env.store.get_approval(run.id, "APPROVAL_GATE")
+    assert approval.decision == ApprovalDecision.PENDING
+
+
+# ── 审批悬空收敛（P0-2：决定提交后、Run 转换前崩溃）───────
+
+
+@pytest.mark.asyncio
+async def test_decided_approval_with_stale_waiting_run_converges(tmp_path):
+    """审批已决定但 Run 仍停在 WAITING_APPROVAL（旧崩溃窗口）：恢复扫描必须收敛。"""
+    env = await make_env(tmp_path)
+    run = await advance_to_waiting_approval(env)
+    # 模拟旧实现崩溃窗口：只写审批决定，不动 Run 状态
+    await env.store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.APPROVED,
+                                    decided_by="admin")
+    expire_lease(env.store.path, run.id)
+
+    recovered = await TaskRecovery(env.store, env.billing).scan()
+    assert run.id in recovered  # 悬空状态被重新调度
+    await env.engine.run(run.id)
+
+    final = await env.store.get_run(run.id)
+    assert final.status == RunStatus.SUCCEEDED
+    assert refund_count(env.billing) == 1
+
+
+# ── 写 Step 卡在 RUNNING 且幂等键尚未写入 ────────────────
+
+
+@pytest.mark.asyncio
+async def test_stuck_write_step_without_idempotency_key_retries_safely(tmp_path):
+    env = await make_env(tmp_path)
+    run = await advance_to_waiting_approval(env)
+    await approve(env, run)
+    # 模拟：写工具 RUNNING 时崩溃，且幂等键尚未落库（执行前崩溃）
+    await env.store.update_step_status(run.id, "SUBMIT_REFUND", StepStatus.PENDING, StepStatus.READY)
+    await env.store.update_step_status(run.id, "SUBMIT_REFUND", StepStatus.READY, StepStatus.RUNNING)
+    expire_lease(env.store.path, run.id)
+
+    recovered = await TaskRecovery(env.store, env.billing).scan()
+    assert run.id in recovered
+    step = await env.store.get_step(run.id, "SUBMIT_REFUND")
+    assert step.status == StepStatus.OUTCOME_UNKNOWN  # 写 Step 先对账
+
+    await env.engine.run(run.id)
+    final = await env.store.get_run(run.id)
+    # 无幂等键 ⇒ 外部调用从未发出 ⇒ 安全重试成功
+    assert final.status == RunStatus.SUCCEEDED
+    assert refund_count(env.billing) == 1
+
+
+# ── Run 终态与 transcript 标记分阶段恢复 ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_succeeded_but_uncommitted_transcript_is_recovered_once(tmp_path):
+    env = await make_env(tmp_path)
+    run = await advance_to_waiting_approval(env)
+    await approve(env, run)
+    await env.engine.run(run.id)
+    final = await env.store.get_run(run.id)
+    assert final.status == RunStatus.SUCCEEDED and final.transcript_committed is True
+
+    # 模拟 Redis 提交成功、SQLite 标记写失败：回退标记
+    conn = sqlite3.connect(env.store.path)
+    conn.execute("UPDATE runs SET transcript_committed=0 WHERE id=?", (run.id,))
+    conn.commit()
+    conn.close()
+
+    recovered = await TaskRecovery(env.store, env.billing).scan()
+    assert run.id in recovered  # SUCCEEDED 但未提交的 Run 进入恢复清单
+    await env.engine.run(run.id)
+    after = await env.store.get_run(run.id)
+    assert after.transcript_committed is True
+    assert len(env.committed) == 2  # 首次提交 + 补提交各一次
+    await env.engine.run(run.id)   # 标记已写回：引擎侧不再触发第三次提交
+    assert len(env.committed) == 2
+
+
+# ── cancel 与 resume 并发（13.2 #15）────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cancel_resume_race_has_explainable_outcome(tmp_path):
+    from runtime.store import IllegalTransitionError, VersionConflictError
+    env = await make_env(tmp_path)
+    run = await env.store.create_run(**run_fields(message="我这个月被扣了两次款"))
+    await env.engine.run(run.id)
+    run = await env.store.get_run(run.id)
+    assert run.status == RunStatus.WAITING_USER
+
+    async def do_cancel():
+        try:
+            current = await env.store.get_run(run.id)
+            await env.store.update_run_status(current.id, current.version, RunStatus.CANCELLED,
+                                              event_type="RUN_CANCELLED", event_payload={"by": "user"})
+        except VersionConflictError:
+            pass  # 并发下输掉 CAS 的一方按 409 处理（API 层语义）
+
+    async def do_resume():
+        try:
+            current = await env.store.get_run(run.id)
+            await env.store.append_run_input(current.id, current.version, "订单号是 #12345")
+            current = await env.store.get_run(run.id)
+            if current.status != RunStatus.RUNNING:
+                await env.store.update_run_status(current.id, current.version, RunStatus.RUNNING,
+                                                  event_type="RUN_RESUMED")
+        except (VersionConflictError, IllegalTransitionError):
+            pass  # 并发下输掉 CAS 或状态已被取消的一方按 409 处理（API 层语义）
+
+    await asyncio.gather(do_cancel(), do_resume())
+    final = await env.store.get_run(run.id)
+    # 无论谁赢，最终状态都可解释：取消或继续运行，绝无中间态残留
+    assert final.status in (RunStatus.CANCELLED, RunStatus.RUNNING, RunStatus.WAITING_USER)
+    events = [e.event_type for e in await env.store.get_events(run.id)]
+    if final.status == RunStatus.CANCELLED:
+        assert "RUN_CANCELLED" in events
+    else:
+        assert "RUN_RESUMED" in events

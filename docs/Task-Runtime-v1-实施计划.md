@@ -791,3 +791,16 @@ v1 完成后，再按顺序考虑：
 4. Python Hybrid RAG、RRF、rerank 前后归因和文档 ACL。
 5. OpenTelemetry 端到端 Span、成本与 Prompt 版本。
 6. Java parity、前端 Run 时间线和多租户权限。
+
+---
+
+## 18. 实现补充说明（2026-11-18 hardening 记录）
+
+以下实现决策超出原始计划文本，作为计划的正式补充（P2 裁决：保留实现、同步文档）：
+
+1. **Step 转换补充**（第 5.3 节仅定义 Run 转换）：`RUNNING → READY`（只读 Step 过期恢复重试）、`FAILED → READY`（按 attempt 重试，幂等键防重复）、`OUTCOME_UNKNOWN → READY`（对账发现远端未执行/处理中，以同一幂等键重提）。
+2. **runs 表补充两列**：`cancel_requested`（7.5 节 RUNNING 取消标记）、`transcript_committed`（11.4 节会话提交标记），通过 `PRAGMA user_version` 迁移机制加入。
+3. **conv_id / client_request_id 改为可选**：与 `/chat` 行为对齐——未传 conv_id 时按 `uuid5(user_id + ":" + client_id)` 确定性推导，保证重试幂等。
+4. **金额/支付时间一致性校验**（13.3 评测用例落地）：`EVALUATE_DUPLICATE` 以实际扣款记录为准——声称金额与记录不符 → `amount_mismatch` 失败；声称绝对日期与记录不符 → `date_mismatch` 失败；相对日期（昨天/今天）无法确定性比对，跳过。
+5. **故障注入**：`FAIL_AFTER_RESPONSE_BEFORE_CHECKPOINT` 与 `FAIL_AFTER_EFFECT_BEFORE_RESPONSE` 从外部系统视角留下同一状态（记录已写入、客户端未确认），前者用于引擎侧"收到响应但检查点写入前崩溃"的模拟测试。
+6. **RuntimeToolSpec（9.1 节）落地方式**：`runtime/tools.py` 注册表承载白名单与治理元数据（风险/审批/幂等），v1 DAG 由引擎执行器驱动；引擎内部判断类工具（evaluate_duplicate、search_knowledge_base）的 handler 置 None 并注明由执行器实现。

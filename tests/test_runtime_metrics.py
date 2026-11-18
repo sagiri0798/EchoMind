@@ -17,8 +17,14 @@ from runtime.models import ApprovalDecision, RunStatus
 from runtime.store import RunStore
 
 
-def value(counter, **labels):
-    return counter.labels(**labels)._value.get()
+def counter_value(counter, **labels):
+    """通过公共 collect() 接口取计数器值（A8：不依赖 prometheus 私有字段）。"""
+    for metric in counter.collect():
+        for sample in metric.samples:
+            if sample.name.endswith("_total") \
+                    and all(sample.labels.get(key) == val for key, val in labels.items()):
+                return sample.value
+    return 0
 
 
 def count(histogram, **labels):
@@ -57,7 +63,7 @@ async def create_run(store, message="订单 #12345 被扣了两次款，99 元�
 @pytest.mark.asyncio
 async def test_success_flow_increments_runs_and_steps(env):
     store, billing, engine = env
-    before_runs = value(metrics.runs_total, task_type="duplicate_charge_refund",
+    before_runs = counter_value(metrics.runs_total, task_type="duplicate_charge_refund",
                         status="SUCCEEDED")
     before_steps = count(metrics.step_duration, step="LOAD_ORDER", status="SUCCEEDED")
 
@@ -70,7 +76,7 @@ async def test_success_flow_increments_runs_and_steps(env):
                                   event_type="RUN_RESUMED")
     await engine.run(run.id)
 
-    assert value(metrics.runs_total, task_type="duplicate_charge_refund",
+    assert counter_value(metrics.runs_total, task_type="duplicate_charge_refund",
                  status="SUCCEEDED") == before_runs + 1
     assert count(metrics.step_duration, step="LOAD_ORDER", status="SUCCEEDED") \
         == before_steps + 1
@@ -79,8 +85,8 @@ async def test_success_flow_increments_runs_and_steps(env):
 @pytest.mark.asyncio
 async def test_outcome_unknown_and_duplicate_prevented_metrics(env):
     store, billing, engine = env
-    before_unknown = value(metrics.outcome_unknown_total, task_type="duplicate_charge_refund")
-    before_dup = value(metrics.duplicate_prevented_total, tool="submit_refund")
+    before_unknown = counter_value(metrics.outcome_unknown_total, task_type="duplicate_charge_refund")
+    before_dup = counter_value(metrics.duplicate_prevented_total, tool="submit_refund")
 
     run = await create_run(store)
     await engine.run(run.id)
@@ -91,23 +97,23 @@ async def test_outcome_unknown_and_duplicate_prevented_metrics(env):
                                   event_type="RUN_RESUMED")
     billing.enable_fault(FAIL_AFTER_EFFECT_BEFORE_RESPONSE)
     await engine.run(run.id)
-    assert value(metrics.outcome_unknown_total,
+    assert counter_value(metrics.outcome_unknown_total,
                  task_type="duplicate_charge_refund") == before_unknown + 1
 
     # 重新调度：对账后幂等重提被拦截（不产生新退款）
     run = await store.get_run(run.id)
     await engine.run(run.id)
-    assert value(metrics.duplicate_prevented_total, tool="submit_refund") == before_dup + 1
+    assert counter_value(metrics.duplicate_prevented_total, tool="submit_refund") == before_dup + 1
 
 
 @pytest.mark.asyncio
 async def test_failed_run_and_approval_metrics(env):
     store, billing, engine = env
-    before_failed = value(metrics.runs_total, task_type="duplicate_charge_refund",
+    before_failed = counter_value(metrics.runs_total, task_type="duplicate_charge_refund",
                           status="FAILED")
     run = await create_run(store, message="订单 #00000 被扣了两次款，99 元，昨天")
     await engine.run(run.id)
-    assert value(metrics.runs_total, task_type="duplicate_charge_refund",
+    assert counter_value(metrics.runs_total, task_type="duplicate_charge_refund",
                  status="FAILED") == before_failed + 1
 
     # 审批拒绝：引擎拒绝路径计数 + 审批决定计数
@@ -116,10 +122,10 @@ async def test_failed_run_and_approval_metrics(env):
     run = await store.get_run(run.id)
     await store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.REJECTED,
                                 decided_by="admin")
-    before_reject = value(metrics.runs_total, task_type="duplicate_charge_refund",
+    before_reject = counter_value(metrics.runs_total, task_type="duplicate_charge_refund",
                           status="FAILED")
     run = await store.update_run_status(run.id, run.version, RunStatus.RUNNING,
                                         event_type="RUN_RESUMED")
     await engine.run(run.id)
-    assert value(metrics.runs_total, task_type="duplicate_charge_refund",
+    assert counter_value(metrics.runs_total, task_type="duplicate_charge_refund",
                  status="FAILED") == before_reject + 1

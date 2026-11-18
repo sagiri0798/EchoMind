@@ -10,13 +10,12 @@ from datetime import datetime
 from typing import List
 
 from runtime.billing import SandboxBillingClient
-from runtime.models import RunStatus, StepStatus
+from runtime.models import ApprovalDecision, RunStatus, StepStatus
+from runtime.plans import StepKey
 from runtime.store import RunStore
+from runtime.tools import build_runtime_tools, write_tool_names
 
 logger = logging.getLogger(__name__)
-
-# 写工具名单：这些 Step 崩溃后不能盲目重试（9.3 节风险策略）
-WRITE_TOOLS = {"submit_refund"}
 
 
 class TaskRecovery:
@@ -25,6 +24,8 @@ class TaskRecovery:
     def __init__(self, store: RunStore, billing: SandboxBillingClient):
         self._store = store
         self._billing = billing
+        # 写工具名单的单一来源（runtime.tools 注册表，9.1/11.3 节）
+        self._write_tools = write_tool_names(build_runtime_tools(billing))
 
     async def scan(self) -> List[str]:
         """扫描并返回需要交给引擎重新调度的 Run ID 列表。
@@ -33,6 +34,8 @@ class TaskRecovery:
         或本次扫描修复了步骤状态的 Run；等待用户/审批的 Run 保持原状。
         """
         run_ids: List[str] = []
+        # 11.4 节：SUCCEEDED 但会话提交标记未写回 → 交给引擎补提交一次
+        run_ids.extend(run.id for run in await self._store.list_uncommitted_succeeded())
         for run in await self._store.list_active_runs():
             lease_expired = not run.lease_until \
                 or datetime.fromisoformat(run.lease_until) <= datetime.now()
@@ -42,7 +45,7 @@ class TaskRecovery:
             for step in await self._store.get_steps(run.id):
                 if step.status != StepStatus.RUNNING:
                     continue
-                if step.tool_name in WRITE_TOOLS:
+                if step.tool_name in self._write_tools:
                     # 写 Step 结果未知：先对账再决定，不能直接重试
                     await self._store.update_step_status(
                         run.id, step.step_key, StepStatus.RUNNING, StepStatus.OUTCOME_UNKNOWN,
@@ -53,8 +56,15 @@ class TaskRecovery:
                         run.id, step.step_key, StepStatus.RUNNING, StepStatus.READY,
                         event_type="RECOVERY_SCAN", event_payload={"action": "retry"})
                 changed = True
-            if changed or run.status in (RunStatus.RUNNING, RunStatus.OUTCOME_UNKNOWN):
+            if changed or run.status in (RunStatus.RUNNING, RunStatus.OUTCOME_UNKNOWN,
+                                         RunStatus.PAUSED):
                 run_ids.append(run.id)
+                continue
+            # P0-2 悬空收敛：审批已决定但 Run 仍停在 WAITING_APPROVAL（决定提交后崩溃）
+            if run.status == RunStatus.WAITING_APPROVAL:
+                approval = await self._store.get_approval(run.id, StepKey.APPROVAL_GATE.value)
+                if approval is not None and approval.decision != ApprovalDecision.PENDING:
+                    run_ids.append(run.id)
         if run_ids:
             logger.info("恢复扫描发现 %d 个待调度 Run: %s", len(run_ids), run_ids)
         return run_ids

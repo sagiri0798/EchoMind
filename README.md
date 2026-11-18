@@ -197,6 +197,8 @@ docker compose --env-file ../EchoMind/.env up -d --build
 | `ECHOMIND_SKILLS_MAX_PROMPT_CHARS` | Skills 注入字符预算，默认 5000。 |
 | `ECHOMIND_ENV` | 鉴权部署模式，默认 `development`；`production` 必须配置访问 Token。 |
 | `ECHOMIND_API_TOKENS` | 访问 Token 与用户、角色的 JSON 映射，见部署章节。 |
+| `ECHOMIND_RUNTIME_DB` | 任务运行时（/runs）的 SQLite 文件路径，默认 `data/runtime/runtime.db`。 |
+| `ECHOMIND_BILLING_DB` | 沙箱账单系统的 SQLite 文件路径，默认 `data/runtime/sandbox_billing.db`。 |
 
 `APP_ENV` 与 `ECHOMIND_ENV` 用途不同：前者控制 `python api/main.py` 的开发热重载，后者控制生产鉴权要求。Docker 镜像通过 Uvicorn 启动，监听地址和端口由镜像命令指定；修改 `API_HOST`、`API_PORT` 不会改变 Compose 的端口映射。
 

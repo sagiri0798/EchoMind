@@ -1,7 +1,8 @@
-"""Runs API 回归：创建幂等、消息冲突、属主隔离、取消与鉴权覆盖。
+"""Runs API 回归：创建幂等、消息冲突、属主隔离、取消、审批与鉴权覆盖。
 
 使用 ASGI 直连（不经过真实网络），依赖临时 SQLite，不需要 Redis/模型/外网。
 """
+import asyncio
 import json
 
 import httpx
@@ -221,6 +222,67 @@ async def test_non_owner_cancel_is_hidden_and_admin_is_read_only(authed):
     run = await store.update_run_status(run_id, run.version, RunStatus.RUNNING)
     await store.update_run_status(run_id, run.version, RunStatus.WAITING_USER)
     assert (await http.post(f"/runs/{run_id}/cancel", headers=auth("token-user1-0000000000000000"))).status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_concurrent_create_same_request_key_is_idempotent(services):
+    """P1：两个并发 POST /runs 同一请求键——TOCTOU 竞争也必须幂等返回同一 Run。"""
+    store, http = services
+    first, second = await asyncio.gather(
+        http.post("/runs", json=body()),
+        http.post("/runs", json=body()),
+    )
+    assert first.status_code == second.status_code == 202
+    assert first.json()["run_id"] == second.json()["run_id"]
+    assert len(await store.list_active_runs()) == 1  # 只有一行 Run
+
+
+# ── 会话提交幂等与命名空间隔离（P0-3）──────────────────
+
+
+@pytest.mark.asyncio
+async def test_transcript_commit_is_idempotent_and_isolated_from_chat(monkeypatch):
+    """Redis 提交成功、SQLite 标记失败后的恢复重试不得重复 LPUSH；
+    run 专用回执键不得与 /chat 的 client_request_id 冲突。"""
+    import fakeredis.aioredis
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from core.concurrency import KeyedLocks
+    from memory.conversation_memory import MemoryManager
+    from api.main import ChatResponse
+
+    memory = MemoryManager.__new__(MemoryManager)
+    memory._redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    memory._request_locks = KeyedLocks()
+    memory._query_episodic = AsyncMock(return_value={})
+    memory._get_profile = AsyncMock(return_value={})
+
+    async def commit_transcript(run, answer):
+        # 复刻 api/main.py 的提交回调语义
+        response = ChatResponse(conv_id=run.conv_id, request_id=run.id,
+            response=answer, intent="other", agent_type="general", escalated=False,
+            latency_ms=0, status="success")
+        message = (run.input_json or {}).get("message", "")
+        run_turn_id = f"run:{run.id}:final"
+        async with memory.conversation(run.user_id, run.conv_id):
+            receipt = await memory.get_turn_receipt(run.user_id, run.conv_id, run_turn_id)
+            if receipt:
+                if receipt.get("message") != message:
+                    return
+                return  # 已提交过
+            await memory.commit_turn(run.user_id, run.conv_id, run_turn_id,
+                                     message, response.model_dump())
+
+    run = SimpleNamespace(id="run-1", user_id="u1", conv_id="c1",
+                          input_json={"message": "订单 #12345 被扣了两次款，99 元，昨天"})
+    await commit_transcript(run, "回答")
+    await commit_transcript(run, "回答")  # Redis 成功、SQLite 标记失败后的恢复重试
+    messages = await memory._redis.lrange(memory._wm_key("u1", "c1"), 0, -1)
+    assert len(messages) == 2  # 一对消息，没有重复 LPUSH
+    # run 命名空间与 /chat 的 client_request_id 隔离
+    assert await memory.get_turn_receipt("u1", "c1", "run:run-1:final") is not None
+    assert await memory.get_turn_receipt("u1", "c1", "msg-001") is None
+    await memory._redis.aclose()
 
 
 # ── resume 与 approval（PR5）───────────────────────────

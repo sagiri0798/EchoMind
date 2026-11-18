@@ -18,6 +18,7 @@ from runtime.models import ApprovalDecision, RunStatus, StepStatus
 from runtime.store import (
     ApprovalAlreadyDecidedError,
     ApprovalNotFoundError,
+    DuplicateRunError,
     IllegalTransitionError,
     LeaseConflictError,
     LeaseLostError,
@@ -51,6 +52,24 @@ def _require_store() -> RunStore:
     if _store is None:
         raise HTTPException(503, "任务运行时未初始化")
     return _store
+
+
+# 12.3 节：脱敏 Step 与 Event。除常见凭据字段外，业务标识做部分掩码。
+_PII_KEYS = {"user_id", "order_id", "charge_id", "operation_id"}
+
+
+def _scrub(value: Any) -> Any:
+    """递归脱敏 + 业务标识掩码（保留末 4 位，短值整体隐藏）。"""
+    value = redact(value)
+    if isinstance(value, dict):
+        return {
+            key: ("***" + str(item)[-4:] if key in _PII_KEYS and item and len(str(item)) > 4
+                  else ("***" if key in _PII_KEYS and item else _scrub(item)))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_scrub(item) for item in value]
+    return value
 
 
 async def _load_owned_run(store: RunStore, request: Request, run_id: str):
@@ -163,16 +182,25 @@ async def create_run(body: RunCreateRequest, request: Request):
         return RunCreatedResponse(run_id=existing.id, status=existing.status.value,
                                   current_step=existing.current_step)
 
-    run = await store.create_run(
-        user_id=body.user_id,
-        conv_id=conv_id,
-        client_request_id=client_id,
-        message_hash=message_hash,
-        task_type=body.task_type,
-        plan_version="v1",
-        context_json={},
-        input_json={"message": body.message},
-    )
+    try:
+        run = await store.create_run(
+            user_id=body.user_id,
+            conv_id=conv_id,
+            client_request_id=client_id,
+            message_hash=message_hash,
+            task_type=body.task_type,
+            plan_version="v1",
+            context_json={},
+            input_json={"message": body.message},
+        )
+    except DuplicateRunError as ex:
+        # P1：find_run 与 create_run 之间的并发竞争（TOCTOU）——另一请求已创建，
+        # 幂等返回原 Run，绝不把竞争冒泡成 500
+        existing = await store.get_run(ex.run_id)
+        if existing.message_hash != message_hash:
+            raise HTTPException(409, "同一 client_request_id 不能用于不同消息")
+        return RunCreatedResponse(run_id=existing.id, status=existing.status.value,
+                                  current_step=existing.current_step)
     if _dispatch is not None:
         await _dispatch(run.id)
     return RunCreatedResponse(run_id=run.id, status=run.status.value,
@@ -197,16 +225,18 @@ async def get_run(run_id: str, request: Request):
         transcript_committed=run.transcript_committed,
         error_code=run.error_code,
         retryable=run.retryable,
-        input_json=run.input_json,
-        result_json=run.result_json,
+        input_json=_scrub(run.input_json),
+        result_json=_scrub(run.result_json),
         response_json=run.response_json,
         created_at=run.created_at,
         updated_at=run.updated_at,
         finished_at=run.finished_at,
         steps=[RunStepView(step_key=s.step_key, ordinal=s.ordinal, tool_name=s.tool_name,
                            status=s.status.value, attempt=s.attempt,
-                           idempotency_key=s.idempotency_key, input_json=s.input_json,
-                           output_json=s.output_json, evidence_json=s.evidence_json,
+                           idempotency_key=s.idempotency_key,
+                           input_json=_scrub(s.input_json),
+                           output_json=_scrub(s.output_json),
+                           evidence_json=_scrub(s.evidence_json),
                            error_code=s.error_code, started_at=s.started_at,
                            finished_at=s.finished_at) for s in steps],
         approvals=[RunApprovalView(step_key=a.step_key, risk_summary=a.risk_summary,
@@ -285,6 +315,7 @@ async def resume_run(run_id: str, body: RunResumeRequest, request: Request):
                 event_type="RUN_RESUMED", event_payload={"reason": "user_input"})
     except VersionConflictError as ex:
         raise HTTPException(409, "Run 已被修改，请重新查询后再操作") from ex
+    runtime_metrics.record_resume("user_input")
     if _dispatch is not None:
         await _dispatch(run_id)
     return {"run_id": run_id, "status": run.status.value}
@@ -310,41 +341,18 @@ async def decide_approval(run_id: str, body: ApprovalRequest, request: Request):
     decision = (ApprovalDecision.APPROVED if body.decision == "approve"
                 else ApprovalDecision.REJECTED)
     try:
-        await store.decide_approval(run_id, body.step_key, decision,
-                                    decided_by=decided_by, comment=body.comment or None)
+        # P0-2：审批决定 + Run 状态转换 + 事件在同一事务完成，不存在悬空中间态
+        run = await store.decide_approval_with_consequences(
+            run_id, body.step_key, decision, decided_by, body.comment or None,
+            expected_version=run.version)
     except ApprovalAlreadyDecidedError as ex:
         raise HTTPException(409, str(ex)) from ex
     except ApprovalNotFoundError as ex:
         raise HTTPException(404, str(ex)) from ex
+    except (VersionConflictError, IllegalTransitionError, LeaseConflictError,
+            LeaseLostError) as ex:
+        raise HTTPException(409, "Run 已被修改或状态不允许审批") from ex
     runtime_metrics.record_approval(decision.value)
-    try:
-        if decision == ApprovalDecision.REJECTED:
-            # 拒绝：安全失败/升级路径，不执行退款；写工具相关步骤跳过
-            # 状态机要求 WAITING_APPROVAL → RUNNING → FAILED 两步走（5.3 节）
-            try:
-                await store.update_step_status(
-                    run_id, body.step_key, StepStatus.WAITING_APPROVAL, StepStatus.FAILED,
-                    error_code="approval_rejected")
-            except (IllegalTransitionError, RuntimeError):
-                # 步骤状态异常时由引擎在重新调度后兜底处理；Run 级失败仍然生效
-                logger.warning("拒绝审批时步骤状态更新失败，交由引擎兜底: %s/%s", run_id, body.step_key)
-            run = await store.update_run_status(
-                run_id, run.version, RunStatus.RUNNING,
-                event_type="RUN_RESUMED", event_payload={"reason": "approval_rejected"})
-            run = await store.update_run_status(
-                run_id, run.version, RunStatus.FAILED,
-                error_code="approval_rejected", retryable=False,
-                response_json={"response": "退款申请未获批准，本次不执行退款。如有疑问请联系人工客服。"},
-                event_type="RUN_FAILED", event_payload={"reason": "approval_rejected"})
-            return {"run_id": run_id, "status": run.status.value, "decision": "rejected"}
-        # approve：转回 RUNNING 并调度引擎继续
-        run = await store.update_run_status(
-            run_id, run.version, RunStatus.RUNNING,
-            event_type="RUN_RESUMED", event_payload={"reason": "approval_approved"})
-        if _dispatch is not None:
-            await _dispatch(run_id)
-        return {"run_id": run_id, "status": run.status.value, "decision": "approved"}
-    except VersionConflictError as ex:
-        raise HTTPException(409, "Run 已被修改，请重新查询后再操作") from ex
-    except (IllegalTransitionError, LeaseConflictError, LeaseLostError) as ex:
-        raise HTTPException(409, str(ex)) from ex
+    if decision == ApprovalDecision.APPROVED and _dispatch is not None:
+        await _dispatch(run_id)
+    return {"run_id": run_id, "status": run.status.value, "decision": decision.value}
