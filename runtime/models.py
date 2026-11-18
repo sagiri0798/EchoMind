@@ -81,6 +81,7 @@ class Run:
     version:            int              = 0
     lease_owner:        Optional[str]    = None
     lease_until:        Optional[str]    = None
+    cancel_requested:   bool             = False
     transcript_committed: bool           = False
     created_at:         str              = field(default_factory=now_iso)
     updated_at:         str              = field(default_factory=now_iso)

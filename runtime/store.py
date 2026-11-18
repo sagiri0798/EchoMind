@@ -36,7 +36,12 @@ from runtime.state_machine import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_LEASE_SECONDS = 30
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# 版本迁移：键为目标版本号；_MIGRATIONS[2] 是把 v1 数据库升级到 v2 的语句
+_MIGRATIONS = {
+    2: ["ALTER TABLE runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0"],
+}
 
 
 # ── 异常 ──────────────────────────────────────────────
@@ -112,6 +117,7 @@ CREATE TABLE IF NOT EXISTS runs (
   version              INTEGER NOT NULL DEFAULT 0,
   lease_owner          TEXT,
   lease_until          TEXT,
+  cancel_requested     INTEGER NOT NULL DEFAULT 0,
   transcript_committed INTEGER NOT NULL DEFAULT 0,
   created_at           TEXT NOT NULL,
   updated_at           TEXT NOT NULL,
@@ -194,6 +200,7 @@ def _run_to_row(run: Run) -> dict:
         "version": run.version,
         "lease_owner": run.lease_owner,
         "lease_until": run.lease_until,
+        "cancel_requested": int(run.cancel_requested),
         "transcript_committed": int(run.transcript_committed),
         "created_at": run.created_at,
         "updated_at": run.updated_at,
@@ -221,6 +228,7 @@ def _run_from_row(row: sqlite3.Row) -> Run:
         version=row["version"],
         lease_owner=row["lease_owner"],
         lease_until=row["lease_until"],
+        cancel_requested=bool(row["cancel_requested"]),
         transcript_committed=bool(row["transcript_committed"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -277,6 +285,20 @@ def _event_from_row(row: sqlite3.Row) -> RunEvent:
     )
 
 
+def _approval_from_row(row: sqlite3.Row) -> RunApproval:
+    return RunApproval(
+        id=row["id"],
+        run_id=row["run_id"],
+        step_key=row["step_key"],
+        risk_summary=row["risk_summary"],
+        decision=ApprovalDecision(row["decision"]),
+        decided_by=row["decided_by"],
+        comment=row["comment"],
+        created_at=row["created_at"],
+        decided_at=row["decided_at"],
+    )
+
+
 class RunStore:
     """SQLite 持久化的任务状态存储。所有写操作带版本/租约校验。
 
@@ -323,7 +345,18 @@ class RunStore:
 
     def _bootstrap(self) -> None:
         with self._connect() as conn:
+            existed = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='runs'"
+            ).fetchone() is not None
             conn.executescript(_SCHEMA)
+            if not existed:
+                # 全新数据库：直接标记为最新版本，跳过历史迁移
+                conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                return
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            for target in range(version + 1, SCHEMA_VERSION + 1):
+                for stmt in _MIGRATIONS.get(target, []):
+                    conn.execute(stmt)
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     # ── Run 创建与读取 ────────────────────────────────
@@ -502,6 +535,45 @@ class RunStore:
         return dataclasses.replace(run, lease_owner=owner, lease_until=lease_until,
                                    version=run.version + 1, updated_at=now_iso())
 
+    # ── 取消 ──────────────────────────────────────────
+
+    async def request_cancel(self, run_id: str, expected_version: int) -> Run:
+        """对 RUNNING 状态的 Run 设置取消标记；引擎在安全检查点响应。
+
+        重复设置幂等：已标记时直接返回当前 Run，不递增版本。
+        """
+        return await asyncio.to_thread(self._request_cancel, run_id, expected_version)
+
+    def _request_cancel(self, run_id: str, expected_version: int) -> Run:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise RunNotFoundError(f"Run 不存在: {run_id}")
+            run = _run_from_row(row)
+            if run.version != expected_version:
+                conn.execute("ROLLBACK")
+                raise VersionConflictError(
+                    f"版本冲突: 期望 {expected_version}，当前 {run.version}"
+                )
+            if run.status != RunStatus.RUNNING:
+                conn.execute("ROLLBACK")
+                raise IllegalTransitionError(
+                    f"仅 RUNNING 状态支持取消标记，当前 {run.status.value}"
+                )
+            if run.cancel_requested:
+                conn.execute("COMMIT")  # 已标记，幂等返回
+                return run
+            conn.execute(
+                "UPDATE runs SET cancel_requested=1, version=version+1, updated_at=? WHERE id=?",
+                (now_iso(), run_id),
+            )
+            self._insert_event(conn, run_id, "CANCEL_REQUESTED", None, {"by": "user"})
+            conn.execute("COMMIT")
+        return dataclasses.replace(run, cancel_requested=True, version=run.version + 1,
+                                   updated_at=now_iso())
+
     # ── Step ──────────────────────────────────────────
 
     async def create_steps(self, run_id: str, steps: list[RunStep]) -> None:
@@ -621,6 +693,19 @@ class RunStore:
             started_at=started_at,
             finished_at=finished_at or step.finished_at,
         )
+
+    # ── 审批 ──────────────────────────────────────────
+
+    async def get_approvals(self, run_id: str) -> list[RunApproval]:
+        """按创建顺序返回全部审批记录。创建/决定方法在 PR5 实现。"""
+        return await asyncio.to_thread(self._get_approvals, run_id)
+
+    def _get_approvals(self, run_id: str) -> list[RunApproval]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM run_approvals WHERE run_id=? ORDER BY created_at ASC", (run_id,)
+            ).fetchall()
+            return [_approval_from_row(row) for row in rows]
 
     # ── 事件 ──────────────────────────────────────────
 

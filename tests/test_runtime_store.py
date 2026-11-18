@@ -217,6 +217,45 @@ async def test_leased_run_write_requires_matching_owner(store):
     assert ok.status == RunStatus.RUNNING
 
 
+# ── 取消与迁移 ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_request_cancel_sets_flag_and_event_and_is_idempotent(store):
+    run = await store.create_run(**make_run_fields())
+    run = await store.update_run_status(run.id, 0, RunStatus.RUNNING)
+    updated = await store.request_cancel(run.id, expected_version=run.version)
+    assert updated.cancel_requested and updated.status == RunStatus.RUNNING
+    assert (await store.get_events(run.id))[-1].event_type == "CANCEL_REQUESTED"
+    # 幂等：重复请求不递增版本
+    again = await store.request_cancel(run.id, expected_version=updated.version)
+    assert again.version == updated.version
+
+
+@pytest.mark.asyncio
+async def test_request_cancel_requires_running_status(store):
+    run = await store.create_run(**make_run_fields())
+    with pytest.raises(IllegalTransitionError):
+        await store.request_cancel(run.id, expected_version=0)
+
+
+@pytest.mark.asyncio
+async def test_migration_adds_cancel_requested_column(tmp_path):
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE runs (id TEXT PRIMARY KEY)")  # v1 简化模拟
+    conn.execute("PRAGMA user_version=1")
+    conn.commit()
+    conn.close()
+    store = RunStore(path)
+    await store.bootstrap()
+    conn = sqlite3.connect(path)
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(runs)")]
+    assert "cancel_requested" in columns
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    conn.close()
+
+
 # ── Step ──────────────────────────────────────────────
 
 

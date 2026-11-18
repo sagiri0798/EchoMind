@@ -60,6 +60,7 @@ _eval_tool_manager = None
 _skill_manager = None
 _profile_updater = None
 _mcp_client = None
+_runtime_store = None
 from evaluation.jobs import EvaluationJobs
 _eval_jobs = EvaluationJobs()
 
@@ -207,6 +208,21 @@ async def lifespan(app: FastAPI):
     from core.concurrency import ProfileUpdater
     _profile_updater = ProfileUpdater(_memory, workers=int(os.getenv("PROFILE_UPDATE_WORKERS", "4")))
     _profile_updater.start()
+
+    # 任务运行时（/runs）：SQLite 持久化；初始化失败只影响 /runs，不拖垮 /chat
+    try:
+        from runtime.store import RunStore
+        from runtime.api import configure as configure_runs
+        runtime_db = pathlib.Path(os.getenv(
+            "ECHOMIND_RUNTIME_DB", str(pathlib.Path(_ROOT) / "data/runtime/runtime.db")))
+        runtime_db.parent.mkdir(parents=True, exist_ok=True)
+        _runtime_store = RunStore(runtime_db)
+        await _runtime_store.bootstrap()
+        configure_runs(_runtime_store)
+        logger.info(f"任务运行时已初始化: {runtime_db}")
+    except Exception as ex:
+        logger.warning("任务运行时初始化失败，/runs 接口不可用: %s", ex)
+
     logger.info("EchoMind 已就绪")
     async with standard_mcp_server.session_manager.run():
         try:
@@ -261,6 +277,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── 子路由：任务运行时（/runs），属主判断见 runtime/api.py ────────────────────
+from runtime.api import router as runs_router
+app.include_router(runs_router)
+
 
 @app.middleware("http")
 async def access_control(request: HTTPRequest, call_next):
@@ -274,7 +294,8 @@ async def access_control(request: HTTPRequest, call_next):
     if account is not None and request.url.path != "/health" and request.method != "OPTIONS":
         if not account:
             return JSONResponse({"detail": "需要有效 Bearer Token"}, status_code=401)
-        reader = request.url.path in {"/chat", "/search", "/knowledge/stats", "/skills", "/mcp", "/mcp/"}
+        reader = request.url.path in {"/chat", "/search", "/knowledge/stats", "/skills", "/mcp", "/mcp/"} \
+            or request.url.path.startswith("/runs")
         if not reader and account["role"] != "admin":
             return JSONResponse({"detail": "该接口需要管理员权限"}, status_code=403)
     is_chat = request.url.path == "/chat" and request.method == "POST"
