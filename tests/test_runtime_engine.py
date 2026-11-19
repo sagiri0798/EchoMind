@@ -138,10 +138,16 @@ async def test_unknown_order_fails_with_explanation(env):
 
 @pytest.mark.asyncio
 async def test_knowledge_failure_fails_without_refund(env):
+    from dataclasses import replace
+
     async def broken(params, ctx):
         raise RuntimeError("知识库超时")
 
-    env.engine._tools["search_knowledge_base"] = broken
+    registry = dict(env.engine._tool_registry)
+    spec = registry["search_knowledge_base"]
+    registry["search_knowledge_base"] = replace(spec, handler=broken)
+    env.engine._tool_registry = registry
+
     run = await create_run(env.store)
     await env.engine.run(run.id)
 
@@ -229,6 +235,41 @@ async def test_approval_required_before_any_refund_submit(env):
     count = conn.execute("SELECT COUNT(*) FROM refunds").fetchone()[0]
     conn.close()
     assert count == 0  # 审批前绝不执行退款
+
+
+@pytest.mark.asyncio
+async def test_tool_timeout_pauses_and_recovers(env):
+    """P1：RuntimeToolSpec.timeout_s 真正生效——挂起工具 → PAUSED 可重试；恢复后继续。"""
+    from dataclasses import replace
+
+    async def hung(params, ctx):
+        await asyncio.sleep(30)
+        return []
+
+    registry = dict(env.engine._tool_registry)
+    spec = registry["search_knowledge_base"]
+    registry["search_knowledge_base"] = replace(spec, timeout_s=0.1, handler=hung)
+    env.engine._tool_registry = registry
+
+    run = await create_run(env.store)
+    await env.engine.run(run.id)
+
+    paused = await env.store.get_run(run.id)
+    assert paused.status == RunStatus.PAUSED
+    assert paused.error_code == "knowledge_timeout" and paused.retryable is True
+    assert (await env.store.get_step(run.id, "SEARCH_REFUND_POLICY")).status == StepStatus.READY
+
+    # 恢复：换回快速 handler 并 resume
+    async def fast(params, ctx):
+        return [{"title": "退款政策", "content": "重复扣款可在 7 日内申请原路退回"}]
+
+    registry["search_knowledge_base"] = replace(spec, timeout_s=10.0, handler=fast)
+    env.engine._tool_registry = registry
+    paused = await env.store.update_run_status(paused.id, paused.version, RunStatus.RUNNING,
+                                               event_type="RUN_RESUMED")
+    await env.engine.run(run.id)
+    final = await env.store.get_run(run.id)
+    assert final.status == RunStatus.WAITING_APPROVAL  # 恢复后正常推进到审批
 
 
 # ── 13.2 测试缺口补强（S11）────────────────────────────

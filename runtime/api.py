@@ -227,7 +227,7 @@ async def get_run(run_id: str, request: Request):
         retryable=run.retryable,
         input_json=_scrub(run.input_json),
         result_json=_scrub(run.result_json),
-        response_json=run.response_json,
+        response_json=_scrub(run.response_json),
         created_at=run.created_at,
         updated_at=run.updated_at,
         finished_at=run.finished_at,

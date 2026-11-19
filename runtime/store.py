@@ -733,20 +733,23 @@ class RunStore:
         error_code: Optional[str] = None,
         event_type: Optional[str] = None,
         event_payload: Optional[dict] = None,
+        checkpoint: Optional[dict] = None,
     ) -> RunStep:
         """Step 状态转换：期望状态不匹配（CAS）或转换非法时拒绝，事务回滚。
 
         idempotency_key 在执行写工具前持久化（9.2 节），重试复用相同键。
+        checkpoint 在同一事务内写 CHECKPOINT_COMMITTED 事件（12.1 节），
+        状态与检查点不存在"状态已提交、事件丢失"的窗口。
         """
         return await asyncio.to_thread(
             self._update_step_status, run_id, step_key, expected_status, next_status,
             attempt, idempotency_key, output_json, evidence_json, error_code,
-            event_type, event_payload,
+            event_type, event_payload, checkpoint,
         )
 
     def _update_step_status(self, run_id, step_key, expected_status, next_status, attempt,
                             idempotency_key, output_json, evidence_json, error_code,
-                            event_type, event_payload) -> RunStep:
+                            event_type, event_payload, checkpoint) -> RunStep:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -795,6 +798,8 @@ class RunStore:
             )
             if event_type:
                 self._insert_event(conn, run_id, event_type, step_key, event_payload)
+            if checkpoint is not None:
+                self._insert_event(conn, run_id, "CHECKPOINT_COMMITTED", step_key, checkpoint)
             conn.execute("COMMIT")
         return dataclasses.replace(
             step,

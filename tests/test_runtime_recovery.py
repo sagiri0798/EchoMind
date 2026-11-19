@@ -321,6 +321,77 @@ async def test_succeeded_but_uncommitted_transcript_is_recovered_once(tmp_path):
     assert len(env.committed) == 2
 
 
+# ── P0：最终回答 Step 已提交、Run 终态未提交时崩溃 ─────────
+
+
+@pytest.mark.asyncio
+async def test_crash_between_step_and_run_success_rebuilds_answer(tmp_path, monkeypatch):
+    """P0：回答持久化在 BUILD_* Step 输出；Run 终态提交前崩溃，恢复重建回答而非 plan_exhausted。"""
+    env = await make_env(tmp_path)
+    run = await env.store.create_run(
+        **run_fields(message="订单 #67890 昨天支付了 199 元，帮我看看扣款记录"))
+    original = env.store.update_run_status
+
+    async def flaky(run_id, expected_version, next_status, **kwargs):
+        if next_status == RunStatus.SUCCEEDED:
+            raise RuntimeError("模拟崩溃：Run 终态提交前进程挂掉")
+        return await original(run_id, expected_version, next_status, **kwargs)
+
+    monkeypatch.setattr(env.store, "update_run_status", flaky)
+    with pytest.raises(RuntimeError):
+        await env.engine.run(run.id)
+
+    run = await env.store.get_run(run.id)
+    assert run.status == RunStatus.RUNNING  # 终态未写
+    step = await env.store.get_step(run.id, "BUILD_NO_REFUND_ANSWER")
+    assert step.status == StepStatus.SUCCEEDED
+    assert "没有发现重复扣款" in step.output_json["answer"]  # 回答已持久化到 Step 输出
+
+    monkeypatch.setattr(env.store, "update_run_status", original)
+    expire_lease(env.store.path, run.id)
+    recovered = await TaskRecovery(env.store, env.billing).scan()
+    assert run.id in recovered
+    await env.engine.run(run.id)
+
+    final = await env.store.get_run(run.id)
+    assert final.status == RunStatus.SUCCEEDED
+    assert "没有发现重复扣款" in final.response_json["response"]
+    assert final.error_code != "plan_exhausted"
+
+
+# ── P1：非重复分支 SKIP 循环中途崩溃 ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_partial_skip_recovery_reruns_tolerantly(tmp_path):
+    """P1：SKIP 半提交后重跑 EVALUATE_DUPLICATE，不得对已 SKIPPED 的 Step 提交非法转换。"""
+    env = await make_env(tmp_path)
+    run = await env.store.create_run(
+        **run_fields(message="订单 #67890 昨天支付了 199 元，帮我看看扣款记录"))
+    await env.engine.run(run.id)  # 正常完成
+
+    # 模拟 SKIP 循环中途崩溃：EVALUATE 回 READY、部分步骤回 PENDING、清空 response
+    conn = sqlite3.connect(env.store.path)
+    conn.execute("UPDATE run_steps SET status='READY' WHERE run_id=? AND step_key='EVALUATE_DUPLICATE'",
+                 (run.id,))
+    conn.execute("UPDATE run_steps SET status='PENDING' WHERE run_id=? AND step_key='SUBMIT_REFUND'",
+                 (run.id,))
+    conn.execute("UPDATE run_steps SET status='PENDING' WHERE run_id=? AND step_key='BUILD_NO_REFUND_ANSWER'",
+                 (run.id,))
+    conn.execute("UPDATE runs SET status='RUNNING', response_json=NULL WHERE id=?", (run.id,))
+    conn.commit()
+    conn.close()
+    expire_lease(env.store.path, run.id)
+
+    recovered = await TaskRecovery(env.store, env.billing).scan()
+    assert run.id in recovered
+    await env.engine.run(run.id)  # 不允许抛 IllegalTransitionError
+
+    final = await env.store.get_run(run.id)
+    assert final.status == RunStatus.SUCCEEDED
+    assert "没有发现重复扣款" in final.response_json["response"]
+
+
 # ── cancel 与 resume 并发（13.2 #15）────────────────────
 
 
