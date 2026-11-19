@@ -241,19 +241,28 @@ async def lifespan(app: FastAPI):
             return list(getattr(result, "data", None) or [])
 
         async def commit_transcript(run, answer):
-            # 最终回答通过现有会话锁与整轮提交写入 Redis（11.4 节），不改变 /chat 语义
-            response = ChatResponse(conv_id=run.conv_id, request_id=run.client_request_id,
+            # P0-3：会话提交幂等。专用命名空间 run:{run_id}:final 避免与 /chat 的
+            # client_request_id 共享回执键；同一会话锁内先查回执，已提交则不再 LPUSH。
+            response = ChatResponse(conv_id=run.conv_id, request_id=run.id,
                 response=answer, intent="other", agent_type="general", escalated=False,
                 latency_ms=0, status="success")
             message = (run.input_json or {}).get("message", "")
+            run_turn_id = f"run:{run.id}:final"
             async with _memory.conversation(run.user_id, run.conv_id):
-                await _memory.commit_turn(run.user_id, run.conv_id, run.client_request_id,
+                receipt = await _memory.get_turn_receipt(run.user_id, run.conv_id, run_turn_id)
+                if receipt:
+                    if receipt.get("message") != message:
+                        logger.warning("run 回执消息不一致，跳过重复提交: %s", run.id)
+                    return  # Redis 已提交成功、SQLite 标记失败后的恢复场景
+                await _memory.commit_turn(run.user_id, run.conv_id, run_turn_id,
                                           message, response.model_dump())
 
         _runtime_engine = TaskEngine(
             _runtime_store, _billing,
             tools={"search_knowledge_base": runtime_knowledge_search},
             transcript_commit=commit_transcript,
+            # 7.3 节：补充输入经过现有意图实体提取链路
+            entity_extractor=lambda msg: recognizer._extract_entities(msg),
         )
         configure_dispatch(_runtime_engine.schedule)
 

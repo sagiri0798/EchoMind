@@ -1,7 +1,7 @@
 {
   "suite": "refund-v1",
   "task_type": "duplicate_charge_refund",
-  "说明": "确定性退款评测集（实施计划 13.3 节）。所有依赖均为沙箱：SQLite 账单数据、假知识库工具；不调用真实模型、真实支付或外网。v1 边界：金额/时间一致性不做业务校验（以实际扣款记录为准），时间窗政策校验未实现。",
+  "说明": "确定性退款评测集（实施计划 13.3 节）。所有依赖均为沙箱：SQLite 账单数据、假知识库工具；不调用真实模型、真实支付或外网。金额/时间一致性校验已实现：与扣款记录不符时不自动退款（以实际扣款记录为准）。",
   "cases": [
     {
       "id": "normal_refund",
@@ -22,36 +22,34 @@
     },
     {
       "id": "amount_mismatch",
-      "description": "金额不一致（用户声称 100 元，扣款记录 99 元；v1 以实际扣款记录为准）",
+      "description": "金额不一致（用户声称 100 元，扣款记录 99 元）",
       "user_id": "u1",
       "message": "订单 #12345 被扣了两次款，每次 100 元，昨天支付的",
       "kb": "ok",
       "fault": null,
-      "actions": ["run", "approve", "run"],
+      "actions": ["run"],
       "expect": {
-        "final_status": "SUCCEEDED",
-        "key_steps": ["SUBMIT_REFUND"],
-        "tools_called": ["submit_refund"],
-        "approval_decision": "approved",
-        "refund_count": 1,
-        "refund_amount_cents": 9900,
-        "answer_contains": ["退款"]
+        "final_status": "FAILED",
+        "error_code": "amount_mismatch",
+        "refund_count": 0,
+        "tools_not_called": ["submit_refund"],
+        "answer_contains": ["不一致", "不自动退款"]
       }
     },
     {
       "id": "time_out_of_policy",
-      "description": "时间不在政策范围（v1 未实现时间窗校验，按正常流程处理）",
+      "description": "时间不在政策范围（声称 2026-09-01，扣款记录 2026-11-01）",
       "user_id": "u1",
       "message": "订单 #12345 在 2026-09-01 被扣了两次款，99 元",
       "kb": "ok",
       "fault": null,
-      "actions": ["run", "approve", "run"],
+      "actions": ["run"],
       "expect": {
-        "final_status": "SUCCEEDED",
-        "key_steps": ["SUBMIT_REFUND"],
-        "tools_called": ["submit_refund"],
-        "approval_decision": "approved",
-        "refund_count": 1
+        "final_status": "FAILED",
+        "error_code": "date_mismatch",
+        "refund_count": 0,
+        "tools_not_called": ["submit_refund"],
+        "answer_contains": ["不一致", "不自动退款"]
       }
     },
     {

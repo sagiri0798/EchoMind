@@ -138,10 +138,16 @@ async def test_unknown_order_fails_with_explanation(env):
 
 @pytest.mark.asyncio
 async def test_knowledge_failure_fails_without_refund(env):
+    from dataclasses import replace
+
     async def broken(params, ctx):
         raise RuntimeError("知识库超时")
 
-    env.engine._tools["search_knowledge_base"] = broken
+    registry = dict(env.engine._tool_registry)
+    spec = registry["search_knowledge_base"]
+    registry["search_knowledge_base"] = replace(spec, handler=broken)
+    env.engine._tool_registry = registry
+
     run = await create_run(env.store)
     await env.engine.run(run.id)
 
@@ -229,3 +235,121 @@ async def test_approval_required_before_any_refund_submit(env):
     count = conn.execute("SELECT COUNT(*) FROM refunds").fetchone()[0]
     conn.close()
     assert count == 0  # 审批前绝不执行退款
+
+
+@pytest.mark.asyncio
+async def test_tool_timeout_pauses_and_recovers(env):
+    """P1：RuntimeToolSpec.timeout_s 真正生效——挂起工具 → PAUSED 可重试；恢复后继续。"""
+    from dataclasses import replace
+
+    async def hung(params, ctx):
+        await asyncio.sleep(30)
+        return []
+
+    registry = dict(env.engine._tool_registry)
+    spec = registry["search_knowledge_base"]
+    registry["search_knowledge_base"] = replace(spec, timeout_s=0.1, handler=hung)
+    env.engine._tool_registry = registry
+
+    run = await create_run(env.store)
+    await env.engine.run(run.id)
+
+    paused = await env.store.get_run(run.id)
+    assert paused.status == RunStatus.PAUSED
+    assert paused.error_code == "knowledge_timeout" and paused.retryable is True
+    assert (await env.store.get_step(run.id, "SEARCH_REFUND_POLICY")).status == StepStatus.READY
+
+    # 恢复：换回快速 handler 并 resume
+    async def fast(params, ctx):
+        return [{"title": "退款政策", "content": "重复扣款可在 7 日内申请原路退回"}]
+
+    registry["search_knowledge_base"] = replace(spec, timeout_s=10.0, handler=fast)
+    env.engine._tool_registry = registry
+    paused = await env.store.update_run_status(paused.id, paused.version, RunStatus.RUNNING,
+                                               event_type="RUN_RESUMED")
+    await env.engine.run(run.id)
+    final = await env.store.get_run(run.id)
+    assert final.status == RunStatus.WAITING_APPROVAL  # 恢复后正常推进到审批
+
+
+# ── 13.2 测试缺口补强（S11）────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_billing_unavailable_pauses_and_recovers(env):
+    """FAIL_BEFORE_EFFECT 端到端：瞬时账单故障 → PAUSED 可恢复，重试后成功（P1-2）。"""
+    from runtime.billing import FAIL_BEFORE_EFFECT
+    from runtime.models import ApprovalDecision
+    run = await create_run(env.store)
+    await env.engine.run(run.id)
+    run = await env.store.get_run(run.id)
+    await env.store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.APPROVED,
+                                    decided_by="admin")
+    await env.store.update_run_status(run.id, run.version, RunStatus.RUNNING,
+                                      event_type="RUN_RESUMED")
+    env.billing.enable_fault(FAIL_BEFORE_EFFECT)
+    await env.engine.run(run.id)
+
+    paused = await env.store.get_run(run.id)
+    assert paused.status == RunStatus.PAUSED
+    assert paused.error_code == "billing_unavailable" and paused.retryable is True
+    assert (await env.store.get_step(run.id, "SUBMIT_REFUND")).status == StepStatus.READY
+    # 副作用未发生
+    import sqlite3
+    conn = sqlite3.connect(env.billing.path)
+    assert conn.execute("SELECT COUNT(*) FROM refunds").fetchone()[0] == 0
+    conn.close()
+
+    # resume 恢复（API 语义：PAUSED → RUNNING + 调度）
+    paused = await env.store.update_run_status(paused.id, paused.version, RunStatus.RUNNING,
+                                               event_type="RUN_RESUMED")
+    await env.engine.run(run.id)
+    final = await env.store.get_run(run.id)
+    assert final.status == RunStatus.SUCCEEDED
+    conn = sqlite3.connect(env.billing.path)
+    assert conn.execute("SELECT COUNT(*) FROM refunds").fetchone()[0] == 1
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_rerun_after_success_keeps_single_external_write(env):
+    from runtime.models import ApprovalDecision
+    run = await create_run(env.store)
+    await env.engine.run(run.id)
+    run = await env.store.get_run(run.id)
+    await env.store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.APPROVED,
+                                    decided_by="admin")
+    await env.store.update_run_status(run.id, run.version, RunStatus.RUNNING,
+                                      event_type="RUN_RESUMED")
+    await env.engine.run(run.id)
+    # 13.2 #5：完成后再次调度引擎，不产生第二次外部写
+    await env.engine.run(run.id)
+    import sqlite3
+    conn = sqlite3.connect(env.billing.path)
+    count = conn.execute("SELECT COUNT(*) FROM refunds").fetchone()[0]
+    conn.close()
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_resumes_only_one_executes(env):
+    run = await create_run(env.store, message="我这个月好像被扣了两次款")  # 缺订单号
+    await env.engine.run(run.id)
+    assert (await env.store.get_run(run.id)).status == RunStatus.WAITING_USER
+
+    # 模拟 API resume：合并补充输入并转回 RUNNING（仍缺金额/支付时间，会再次 WAITING_USER）
+    run = await env.store.get_run(run.id)
+    run = await env.store.append_run_input(run.id, run.version, "还是没有订单号")
+    run = await env.store.update_run_status(run.id, run.version, RunStatus.RUNNING,
+                                            event_type="RUN_RESUMED")
+
+    engine2 = TaskEngine(env.store, env.billing,
+                         tools={"search_knowledge_base": env.engine._tools["search_knowledge_base"]})
+    # 13.2 #6：两个并发 resume（重新调度引擎），只有一个获得租约并执行
+    await asyncio.gather(env.engine.run(run.id), engine2.run(run.id))
+
+    final = await env.store.get_run(run.id)
+    assert final.status == RunStatus.WAITING_USER  # 仍缺订单号
+    events = [e for e in await env.store.get_events(run.id)
+              if e.event_type == "STEP_STARTED" and e.step_key == "COLLECT_CONTEXT"]
+    assert len(events) == 2  # 首次 1 次 + 并发 resume 中只有一个真正执行

@@ -10,18 +10,18 @@
 - 故障注入只通过客户端构造参数/方法开关，生产代码路径不读取用户可控参数。
 """
 import asyncio
-import logging
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Iterator, List, Optional
 
-logger = logging.getLogger(__name__)
-
 # 故障注入模式（仅测试使用，10 节）
 FAIL_BEFORE_EFFECT = "FAIL_BEFORE_EFFECT"
 FAIL_AFTER_EFFECT_BEFORE_RESPONSE = "FAIL_AFTER_EFFECT_BEFORE_RESPONSE"
+FAIL_AFTER_RESPONSE_BEFORE_CHECKPOINT = "FAIL_AFTER_RESPONSE_BEFORE_CHECKPOINT"
 DELAYED_SUCCESS = "DELAYED_SUCCESS"
+# 说明：从外部系统视角，AFTER_EFFECT_BEFORE_RESPONSE 与 AFTER_RESPONSE_BEFORE_CHECKPOINT
+# 留下同一状态（记录已写入、客户端未确认）；后者用于引擎侧"收到响应但检查点写入前崩溃"的模拟测试。
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
@@ -199,9 +199,14 @@ class SandboxBillingClient:
                 return _row_dict(existing)  # 幂等：返回相同退款记录
             conn.execute("BEGIN IMMEDIATE")
             now = datetime.now().isoformat()
-            status = "processing" if self._fault == DELAYED_SUCCESS else "submitted"
-            if self._fault == DELAYED_SUCCESS:
+            # 业务校验（确定性）：退款金额超过订单金额 → 直接落为 failed 终态
+            if amount_cents > order["amount_cents"]:
+                status = "failed"
+            elif self._fault == DELAYED_SUCCESS:
+                status = "processing"
                 self._fault = None  # 一次性注入：代表外部系统处理较慢
+            else:
+                status = "submitted"
             conn.execute(
                 "INSERT INTO refunds (operation_id, order_id, user_id, amount_cents, reason, "
                 "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -212,7 +217,8 @@ class SandboxBillingClient:
                           amount_cents=amount_cents, reason=reason, status=status,
                           created_at=now, updated_at=now)
         # 故障注入：副作用已发生但响应丢失（本地 checkpoint 前崩溃）
-        if self._fault == FAIL_AFTER_EFFECT_BEFORE_RESPONSE:
+        if self._fault in (FAIL_AFTER_EFFECT_BEFORE_RESPONSE,
+                           FAIL_AFTER_RESPONSE_BEFORE_CHECKPOINT):
             self._fault = None
             raise BillingOutcomeUnknown(operation_id)
         return record
