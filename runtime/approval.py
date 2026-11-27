@@ -46,8 +46,7 @@ async def apply_rejected(store: RunStore, run: Run, step_key: str,
     if run.status == RunStatus.WAITING_APPROVAL:
         run = await store.update_run_status(
             run.id, run.version, RunStatus.RUNNING,
-            lease_owner=lease_owner, event_type="RUN_RESUMED",
-            event_payload={"reason": "approval_rejected"})
+            lease_owner=lease_owner, event_type="RUN_RESUMED", event_payload={"reason": "approval_rejected"})
     return await store.update_run_status(
         run.id, run.version, RunStatus.FAILED,
         lease_owner=lease_owner, error_code="approval_rejected", retryable=False,

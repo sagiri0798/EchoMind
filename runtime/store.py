@@ -26,6 +26,7 @@ from runtime.models import (
     StepStatus,
     now_iso,
 )
+from runtime.policy import anonymous_approval_allowed
 from runtime.state_machine import (
     RUN_TERMINAL,
     STEP_TERMINAL,
@@ -93,6 +94,10 @@ class ApprovalNotFoundError(StoreError):
 
 class ApprovalAlreadyDecidedError(StoreError):
     """审批已经决定过，不允许覆盖。"""
+
+
+class SelfApprovalDeniedError(StoreError):
+    """审批人身份缺失，或审批人是任务所有者（禁止自批）。"""
 
 
 REJECTED_ANSWER = "退款申请未获批准，本次不执行退款。如有疑问请联系人工客服。"
@@ -493,8 +498,10 @@ class RunStore:
                 (
                     next_status.value,
                     current_step if current_step is not None else run.current_step,
-                    _dumps(result_json) if result_json is not None else run.result_json and _dumps(run.result_json),
-                    _dumps(response_json) if response_json is not None else run.response_json and _dumps(run.response_json),
+                    _dumps(result_json) if result_json is not None
+                    else (_dumps(run.result_json) if run.result_json is not None else None),
+                    _dumps(response_json) if response_json is not None
+                    else (_dumps(run.response_json) if run.response_json is not None else None),
                     error_code if error_code is not None else run.error_code,
                     int(retryable) if retryable is not None else run.retryable,
                     now_iso(),
@@ -530,6 +537,21 @@ class RunStore:
         # 租约已过期：旧持有者不能再提交；其他调用方视为无有效租约
         if lease_owner is not None and lease_owner == run.lease_owner:
             raise LeaseLostError(f"租约已过期，持有者 {run.lease_owner} 不能继续提交")
+
+    @staticmethod
+    def _ensure_approver_valid(conn: sqlite3.Connection, run: Run,
+                               decided_by: Optional[str]) -> None:
+        """审批人不能为空，且不能是任务所有者；匿名本地仅在显式开关下豁免。"""
+        if not decided_by or not str(decided_by).strip():
+            conn.execute("ROLLBACK")
+            raise SelfApprovalDeniedError("审批人身份不能为空")
+        if decided_by == "anonymous" and run.user_id != "anonymous":
+            conn.execute("ROLLBACK")
+            raise SelfApprovalDeniedError("匿名审批仅允许 anonymous 用户自己的本地 Run")
+        if decided_by == run.user_id and not (
+                run.user_id == "anonymous" and anonymous_approval_allowed()):
+            conn.execute("ROLLBACK")
+            raise SelfApprovalDeniedError("不能审批自己发起的退款申请")
 
     # ── 租约 ──────────────────────────────────────────
 
@@ -728,6 +750,7 @@ class RunStore:
         *,
         attempt: Optional[int] = None,
         idempotency_key: Optional[str] = None,
+        input_json: Optional[dict] = None,
         output_json: Optional[dict] = None,
         evidence_json: Optional[dict] = None,
         error_code: Optional[str] = None,
@@ -743,12 +766,12 @@ class RunStore:
         """
         return await asyncio.to_thread(
             self._update_step_status, run_id, step_key, expected_status, next_status,
-            attempt, idempotency_key, output_json, evidence_json, error_code,
+            attempt, idempotency_key, input_json, output_json, evidence_json, error_code,
             event_type, event_payload, checkpoint,
         )
 
     def _update_step_status(self, run_id, step_key, expected_status, next_status, attempt,
-                            idempotency_key, output_json, evidence_json, error_code,
+                            idempotency_key, input_json, output_json, evidence_json, error_code,
                             event_type, event_payload, checkpoint) -> RunStep:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -780,15 +803,19 @@ class RunStore:
                 else step.started_at
             finished_at = now_iso() if next_status in STEP_TERMINAL else None
             conn.execute(
-                "UPDATE run_steps SET status=?, attempt=?, idempotency_key=?, output_json=?, "
-                "evidence_json=?, error_code=?, started_at=?, finished_at=? "
+                "UPDATE run_steps SET status=?, attempt=?, idempotency_key=?, input_json=?, "
+                "output_json=?, evidence_json=?, error_code=?, started_at=?, finished_at=? "
                 "WHERE run_id=? AND step_key=?",
                 (
                     next_status.value,
                     attempt if attempt is not None else step.attempt,
                     idempotency_key if idempotency_key is not None else step.idempotency_key,
-                    _dumps(output_json) if output_json is not None else step.output_json and _dumps(step.output_json),
-                    _dumps(evidence_json) if evidence_json is not None else step.evidence_json and _dumps(step.evidence_json),
+                    _dumps(input_json) if input_json is not None
+                    else (_dumps(step.input_json) if step.input_json is not None else None),
+                    _dumps(output_json) if output_json is not None
+                    else (_dumps(step.output_json) if step.output_json is not None else None),
+                    _dumps(evidence_json) if evidence_json is not None
+                    else (_dumps(step.evidence_json) if step.evidence_json is not None else None),
                     error_code if error_code is not None else step.error_code,
                     started_at,
                     finished_at if finished_at is not None else step.finished_at,
@@ -806,6 +833,7 @@ class RunStore:
             status=next_status,
             attempt=attempt if attempt is not None else step.attempt,
             idempotency_key=idempotency_key if idempotency_key is not None else step.idempotency_key,
+            input_json=input_json if input_json is not None else step.input_json,
             output_json=output_json if output_json is not None else step.output_json,
             evidence_json=evidence_json if evidence_json is not None else step.evidence_json,
             error_code=error_code if error_code is not None else step.error_code,
@@ -928,6 +956,7 @@ class RunStore:
                 conn.execute("ROLLBACK")
                 raise ApprovalAlreadyDecidedError(
                     f"审批已决定为 {approval.decision.value}，不可覆盖")
+            self._ensure_approver_valid(conn, run, decided_by)
             decided_at = now_iso()
             conn.execute(
                 "UPDATE run_approvals SET decision=?, decided_by=?, comment=?, decided_at=? "
@@ -976,6 +1005,7 @@ class RunStore:
     def _decide_approval(self, run_id, step_key, decision, decided_by, comment) -> RunApproval:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            run = self._load_run_for_write(conn, run_id)
             row = conn.execute(
                 "SELECT * FROM run_approvals WHERE run_id=? AND step_key=?",
                 (run_id, step_key),
@@ -988,6 +1018,7 @@ class RunStore:
                 conn.execute("ROLLBACK")
                 raise ApprovalAlreadyDecidedError(
                     f"审批已决定为 {approval.decision.value}，不可覆盖")
+            self._ensure_approver_valid(conn, run, decided_by)
             decided_at = now_iso()
             conn.execute(
                 "UPDATE run_approvals SET decision=?, decided_by=?, comment=?, decided_at=? "

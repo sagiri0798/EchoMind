@@ -25,10 +25,16 @@ from typing import Callable, Dict, List, Optional
 
 from runtime import metrics as runtime_metrics
 from runtime.approval import apply_rejected
-from runtime.billing import BillingOutcomeUnknown, BillingUnavailable, SandboxBillingClient
+from runtime.billing import (
+    BillingOutcomeUnknown,
+    BillingUnavailable,
+    RefundConflictError,
+    RefundLimitExceeded,
+    SandboxBillingClient,
+)
 from runtime.models import ApprovalDecision, Run, RunStatus, RunStep, StepStatus
 from runtime.plans import DUP_BRANCH, StepKey, plan_for
-from runtime.policy import can_execute, requires_approval
+from runtime.policy import anonymous_approval_allowed, can_execute, requires_approval
 from runtime.store import (
     LeaseConflictError,
     LeaseLostError,
@@ -67,8 +73,10 @@ class StepOutcome:
     执行器自行写入等待态/终态时设置 context["_finished"]，_execute_step 跳过常规写回。
     """
 
-    def __init__(self, *, output: Optional[dict] = None, evidence: Optional[dict] = None,
+    def __init__(self, *, input: Optional[dict] = None, output: Optional[dict] = None,
+                 evidence: Optional[dict] = None,
                  needs_user_input: Optional[List[str]] = None, answer: Optional[str] = None):
+        self.input = input
         self.output = output
         self.evidence = evidence
         self.needs_user_input = needs_user_input
@@ -94,6 +102,9 @@ class TaskEngine:
         # 实例 ID + 随机令牌（11.2 节）
         self._owner = f"{socket.gethostname() or 'engine'}-{uuid.uuid4().hex[:8]}"
         self._inflight: set = set()
+        # 已在执行时收到的调度请求（如取消/恢复）：当前任务结束后再跑一次，
+        # 避免版本冲突提前 return 后取消检查点/对账分支被漏掉（S1 竞态）。
+        self._pending: set = set()
         self._executors = {
             StepKey.COLLECT_CONTEXT.value: self._step_collect_context,
             StepKey.LOAD_ORDER.value: self._step_load_order,
@@ -113,6 +124,7 @@ class TaskEngine:
     def schedule(self, run_id: str) -> None:
         """后台调度入口（挂在 runtime.api 的 _dispatch）。内存去重只是优化，租约才是保证。"""
         if run_id in self._inflight:
+            self._pending.add(run_id)  # 执行中收到的新请求：结束后补跑一次
             return
         self._inflight.add(run_id)
         asyncio.create_task(self._guarded(run_id))
@@ -139,8 +151,7 @@ class TaskEngine:
                         await self._store.update_step_status(
                             run_id, step.step_key, StepStatus.RUNNING,
                             StepStatus.OUTCOME_UNKNOWN,
-                            event_type="RECOVERY_SCAN",
-                            event_payload={"action": "outcome_unknown"})
+                            event_type="RECOVERY_SCAN", event_payload={"action": "outcome_unknown"})
                     else:
                         await self._store.update_step_status(
                             run_id, step.step_key, StepStatus.RUNNING, StepStatus.READY,
@@ -155,6 +166,19 @@ class TaskEngine:
                 logger.exception("失败状态写入也失败: %s", run_id)
         finally:
             self._inflight.discard(run_id)
+            if run_id in self._pending:
+                self._pending.discard(run_id)
+                # 仅跳过已收敛的终态与 OUTCOME_UNKNOWN（避免重复查询 billing）；
+                # PAUSED 必须补跑：cancel/resume 与版本冲突同时发生时，本次运行可能
+                # 只写回 PAUSED，不补跑会导致 202 取消/补充输入实际未生效。
+                try:
+                    current = await self._store.get_run(run_id)
+                except Exception:
+                    current = None
+                if current is not None and current.status not in (
+                        RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED,
+                        RunStatus.OUTCOME_UNKNOWN):
+                    self.schedule(run_id)
 
     # ── 执行循环 ──────────────────────────────────────
 
@@ -233,9 +257,40 @@ class TaskEngine:
                         return
                     steps = await self._store.get_steps(run_id)
                     submit = next((s for s in steps if s.step_key == StepKey.SUBMIT_REFUND.value), None)
+                if submit is not None and submit.status != StepStatus.SUCCEEDED \
+                        and submit.idempotency_key:
+                    # 7.5 节：写工具已进入 RUNNING/OUTCOME_UNKNOWN 时不能宣称已取消。
+                    # 对账可能把 Step 落回 READY（远端 submitted/processing），必须再查一次
+                    # 远端：只有确认未执行/已失败才允许取消；已成功则按成功收敛。
+                    try:
+                        record = await self._billing.get_refund_status(
+                            submit.idempotency_key, run.user_id)
+                    except Exception:
+                        logger.warning("取消对账查询失败，保守保持未知: %s", run_id, exc_info=True)
+                        record = {"status": "unknown"}
+                    if record is not None and record["status"] == "succeeded":
+                        if submit.status == StepStatus.READY:
+                            submit = await self._store.update_step_status(
+                                run_id, submit.step_key, StepStatus.READY, StepStatus.RUNNING)
+                        submit = await self._store.update_step_status(
+                            run_id, submit.step_key, StepStatus.RUNNING, StepStatus.SUCCEEDED,
+                            event_type="RECONCILED", event_payload={"result": "succeeded"})
+                        await self._activate(run_id, StepKey.POLL_REFUND_STATUS.value)
+                    elif record is not None and record["status"] not in ("failed",):
+                        # submitted/processing/unknown：外部可能已执行，不能取消，等待对账
+                        run = await self._store.update_run_status(
+                            run_id, run.version, RunStatus.OUTCOME_UNKNOWN,
+                            lease_owner=self._owner, current_step=submit.step_key,
+                            event_type="OUTCOME_UNKNOWN", event_payload={"reason": "cancel_reconcile_in_flight"})
+                        runtime_metrics.record_outcome_unknown(run.task_type)
+                        await self._release_lease(run)
+                        return
                 if submit is not None and submit.status == StepStatus.SUCCEEDED:
                     # 外部退款已确认成功：不能宣称已取消，继续完成最终回答
                     pass
+                elif submit is not None and submit.status == StepStatus.OUTCOME_UNKNOWN:
+                    # 对账后仍未知：保守等待，不宣称取消
+                    return
                 else:
                     # 写操作尚未执行/已跳过：安全取消，未执行的分支步骤标记 SKIPPED
                     for pending in steps:
@@ -245,8 +300,7 @@ class TaskEngine:
                                 event_type="STEP_SKIPPED", event_payload={"reason": "cancelled"})
                     run = await self._store.update_run_status(
                         run_id, run.version, RunStatus.CANCELLED,
-                        lease_owner=self._owner, event_type="RUN_CANCELLED",
-                        event_payload={"by": "cancel_requested"},
+                        lease_owner=self._owner, event_type="RUN_CANCELLED", event_payload={"by": "cancel_requested"},
                     )
                     runtime_metrics.record_run_terminal(run.task_type, RunStatus.CANCELLED.value)
                     await self._release_lease(run)
@@ -274,6 +328,23 @@ class TaskEngine:
             if context.get("_finished"):
                 return
 
+    @staticmethod
+    def _ensure_not_self_approved(run: Run, approval) -> None:
+        """执行层 fail-safe：审批人不能为空或等于任务所有者。
+
+        匿名本地调试仅在显式开关下允许 anonymous 用户自批；其余情况一律拒绝
+        执行写工具（防止绕过 API 直接写入的自批记录）。
+        """
+        decided_by = approval.decided_by
+        if not decided_by or not str(decided_by).strip():
+            raise StepFailure("审批人身份缺失，禁止执行退款", "approval_identity_missing")
+        if decided_by == "anonymous" and run.user_id != "anonymous":
+            raise StepFailure("匿名审批仅允许 anonymous 用户自己的本地 Run",
+                              "approval_anonymous_denied")
+        if decided_by == run.user_id and not (
+                run.user_id == "anonymous" and anonymous_approval_allowed()):
+            raise StepFailure("审批人是任务所有者，禁止自批退款", "approval_self_denied")
+
     async def _enforce_tool_policy(self, run: Run, step: RunStep) -> None:
         """9.3 节：白名单、风险与审批在程序层强制，模型、工具和用户都不能绕过。"""
         if not step.tool_name:
@@ -288,6 +359,7 @@ class TaskEngine:
             if approval is None or approval.decision != ApprovalDecision.APPROVED:
                 raise StepFailure(
                     f"写工具 {step.tool_name} 需要人工审批，审批前绝不执行", "approval_required")
+            self._ensure_not_self_approved(run, approval)
 
     async def _execute_step(self, run: Run, context: dict, step: RunStep) -> None:
         expected = step.status  # READY 或（已决定的）WAITING_APPROVAL
@@ -309,7 +381,8 @@ class TaskEngine:
                 error_code=ex.error_code,
                 event_type="STEP_FAILED", event_payload={"error": ex.error_code},
                 checkpoint=self._checkpoint_payload(step, StepStatus.FAILED,
-                                                    time.monotonic() - started, ex.error_code),
+                                                    time.monotonic() - started,
+                                                    error_code=ex.error_code),
             )
             runtime_metrics.record_step(step.step_key, StepStatus.FAILED.value,
                                         time.monotonic() - started)
@@ -330,8 +403,8 @@ class TaskEngine:
             # 等待用户补充：Step 回到 READY，Run 进入 WAITING_USER（8.1 节）
             await self._store.update_step_status(
                 run.id, step.step_key, StepStatus.RUNNING, StepStatus.READY,
-                event_type="STEP_NEEDS_INPUT",
-                event_payload={"missing": outcome.needs_user_input},
+                input_json=outcome.input,
+                event_type="STEP_NEEDS_INPUT", event_payload={"missing": outcome.needs_user_input},
             )
             runtime_metrics.record_step(step.step_key, StepStatus.READY.value,
                                         time.monotonic() - started)
@@ -339,19 +412,25 @@ class TaskEngine:
                 run.id, run.version, RunStatus.WAITING_USER,
                 current_step=step.step_key, lease_owner=self._owner,
                 result_json={"missing_fields": outcome.needs_user_input},
-                event_type="WAITING_USER_INPUT",
-                event_payload={"missing": outcome.needs_user_input},
+                event_type="WAITING_USER_INPUT", event_payload={"missing": outcome.needs_user_input},
             )
             await self._release_lease(run)
             context["_finished"] = True
             return
         # 正常完成：持久化输出与证据（检查点与状态同事务）
         duration = time.monotonic() - started
+        # 12.1：执行器可能刚写入幂等键/输入，重新读取 Step 后再构造检查点，
+        # 否则检查点里的 idempotency_key_hash/evidence_keys 会是执行前的旧快照。
+        fresh = await self._store.get_step(run.id, step.step_key)
+        checkpoint = self._checkpoint_payload(
+            fresh, StepStatus.SUCCEEDED, duration,
+            input_data=outcome.input, evidence=outcome.evidence)
         await self._store.update_step_status(
             run.id, step.step_key, StepStatus.RUNNING, StepStatus.SUCCEEDED,
+            input_json=outcome.input if outcome.input is not None else step.input_json,
             output_json=outcome.output, evidence_json=outcome.evidence,
             event_type="STEP_SUCCEEDED", event_payload={"step": step.step_key},
-            checkpoint=self._checkpoint_payload(step, StepStatus.SUCCEEDED, duration),
+            checkpoint=checkpoint,
         )
         runtime_metrics.record_step(step.step_key, StepStatus.SUCCEEDED.value, duration)
         if outcome.answer is not None:
@@ -368,10 +447,21 @@ class TaskEngine:
             context["_finished"] = True
 
     @staticmethod
-    def _checkpoint_payload(step: RunStep, status: StepStatus, duration_s: float,
+    def _summarize_input(data: Optional[dict]) -> dict:
+        """输入摘要：只保留字段名与哈希，不把订单号/幂等键明文写进事件（9.2/12.2）。"""
+        if not data:
+            return {}
+        canonical = json.dumps(data, sort_keys=True, ensure_ascii=False)
+        return {"keys": sorted(data.keys()),
+                "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]}
+
+    @classmethod
+    def _checkpoint_payload(cls, step: RunStep, status: StepStatus, duration_s: float, *,
+                            input_data: Optional[dict] = None,
+                            evidence: Optional[dict] = None,
                             error_code: Optional[str] = None) -> dict:
         """12.1 节：检查点事件记录输入摘要、工具、幂等键、尝试次数、耗时、状态与证据 ID。"""
-        evidence = step.evidence_json or {}
+        evidence = evidence if evidence is not None else (step.evidence_json or {})
         payload = {
             "step": step.step_key,
             "tool": step.tool_name,
@@ -381,7 +471,8 @@ class TaskEngine:
             "idempotency_key_hash": hashlib.sha256(step.idempotency_key.encode()).hexdigest()[:16]
             if step.idempotency_key else None,
             "evidence_keys": sorted(evidence.keys()),
-            "input_summary": (json.dumps(step.input_json or {}, ensure_ascii=False)[:200]),
+            "input_summary": cls._summarize_input(
+                input_data if input_data is not None else step.input_json),
         }
         if error_code:
             payload["error_code"] = error_code
@@ -510,8 +601,7 @@ class TaskEngine:
                 current_step=answer_step.step_key, lease_owner=self._owner,
                 result_json={"collected": (answer_step.output_json or {}).get("collected", {})},
                 response_json={"response": answer},
-                event_type="RUN_SUCCEEDED",
-                event_payload={"rebuilt_from_step": True},
+                event_type="RUN_SUCCEEDED", event_payload={"rebuilt_from_step": True},
             )
             runtime_metrics.record_run_terminal(run.task_type, RunStatus.SUCCEEDED.value)
             await self._commit_transcript(run, answer)
@@ -717,10 +807,12 @@ class TaskEngine:
         if not merged["date"]:
             missing.append("支付时间")
         if missing:
-            return StepOutcome(output={"entities": merged}, needs_user_input=missing)
+            return StepOutcome(input={"message_chars": len(message)},
+                               output={"entities": merged}, needs_user_input=missing)
         context["collected"] = merged
         context["entities"] = merged
-        return StepOutcome(output={"entities": merged}, evidence={"from": "message"})
+        return StepOutcome(input={"message_chars": len(message)},
+                           output={"entities": merged}, evidence={"from": "message"})
 
     async def _step_load_order(self, run: Run, context: dict, step: RunStep) -> StepOutcome:
         order_id = (context.get("collected", {}).get("order_id") or [None])[0]
@@ -735,7 +827,8 @@ class TaskEngine:
                 answer="未能找到这笔订单，请核对订单号后重新提交。",
             )
         context["order"] = order
-        return StepOutcome(output={"order": order}, evidence={"order_id": order_id})
+        return StepOutcome(input={"order_id": order_id},
+                           output={"order": order}, evidence={"order_id": order_id})
 
     async def _step_load_charges(self, run: Run, context: dict, step: RunStep) -> StepOutcome:
         order_id = context["order"]["order_id"]
@@ -745,7 +838,9 @@ class TaskEngine:
         except ToolTimeoutError as ex:
             return await self._pause_for_retry(run, context, step, "tool_timeout", str(ex))
         context["charges"] = charges
-        return StepOutcome(output={"charge_count": len(charges)}, evidence={"charges": charges})
+        return StepOutcome(input={"order_id": order_id},
+                           output={"charge_count": len(charges)},
+                           evidence={"charges": charges})
 
     async def _step_evaluate_duplicate(self, run: Run, context: dict, step: RunStep) -> StepOutcome:
         """业务一致性校验 + 判断疑似重复扣款并激活对应分支（8.2 节）。
@@ -766,8 +861,12 @@ class TaskEngine:
             raise StepFailure(
                 mismatch, "date_mismatch",
                 answer="您提供的支付时间与扣款记录不一致，本次不自动退款。请核对支付凭证后重新提交或联系人工客服。")
+        order_amount = context["order"]["amount_cents"]
         amounts = [charge["amount_cents"] for charge in charges]
-        duplicate = len(amounts) >= 2 and len(set(amounts)) < len(amounts)
+        total_charged = sum(amounts)
+        # 只有「存在等额重复扣款」且「总扣款 > 订单金额（确有超收）」才进入退款分支
+        duplicate = (len(amounts) >= 2 and len(set(amounts)) < len(amounts)
+                     and total_charged > order_amount)
         if duplicate:
             context["duplicate"] = True
             await self._activate(run.id, StepKey.SEARCH_REFUND_POLICY.value)
@@ -783,7 +882,12 @@ class TaskEngine:
                         event_type="STEP_SKIPPED", event_payload={"reason": "no_duplicate"})
             await self._activate(run.id, StepKey.BUILD_NO_REFUND_ANSWER.value)
         return StepOutcome(
-            output={"duplicate": duplicate, "charge_count": len(amounts)},
+            input={"charge_count": len(amounts),
+                   "claimed_amount_count": len(claimed.get("amount") or []),
+                   "claimed_date_count": len(claimed.get("date") or [])},
+            output={"duplicate": duplicate, "charge_count": len(amounts),
+                    "total_charged_cents": total_charged,
+                    "overcharge_cents": max(0, total_charged - order_amount)},
             evidence={"charges": charges},
         )
 
@@ -791,9 +895,9 @@ class TaskEngine:
         """检索退款政策（只读）。知识库失败按 11.3 测试要求：不进自动退款，保留失败原因；
         超时按瞬时故障处理，落 PAUSED 可重试（P1）。"""
         spec = self._tool_registry["search_knowledge_base"]
+        params = {"query": "重复扣款 退款政策", "top_k": 5}
         try:
-            result = await self._invoke_tool(
-                spec, {"query": "重复扣款 退款政策", "top_k": 5}, {})
+            result = await self._invoke_tool(spec, params, {})
         except ToolTimeoutError as ex:
             return await self._pause_for_retry(run, context, step, "knowledge_timeout", str(ex))
         except Exception as ex:
@@ -803,22 +907,33 @@ class TaskEngine:
             raise StepFailure("知识库未返回退款政策", "knowledge_empty")
         context["policy_docs"] = docs
         await self._activate(run.id, StepKey.PREPARE_REFUND_PROPOSAL.value)
-        return StepOutcome(output={"policy_docs": docs[:3]},
+        return StepOutcome(input=params, output={"policy_docs": docs[:3]},
                            evidence={"source": "search_knowledge_base", "hits": len(docs)})
 
     async def _step_prepare_proposal(self, run: Run, context: dict, step: RunStep) -> StepOutcome:
         """生成退款提案（确定性模板）：退还重复的一笔。"""
         order = context["order"]
         charges = context["charges"]
+        total_charged = sum(charge["amount_cents"] for charge in charges)
+        overcharge = max(0, total_charged - order["amount_cents"])
+        # 提案层校验：单次退款不超过「重复的一笔」与「多收金额」的较小值
+        refund_amount = min(charges[0]["amount_cents"], overcharge)
+        if refund_amount <= 0:
+            # 提案层兜底：多收金额为 0 时绝不生成退款提案（billing 层还有第二道闸门）
+            raise StepFailure("未发现超过订单金额的多收款项", "no_overcharge",
+                              answer="未发现超过订单金额的多收款项，无需发起退款。")
         proposal = {
             "order_id": order["order_id"],
-            "amount_cents": charges[0]["amount_cents"],
-            "reason": f"疑似重复扣款：共 {len(charges)} 笔金额相同的扣款，申请退还多余的一笔",
+            "amount_cents": refund_amount,
+            "reason": (f"疑似重复扣款：共 {len(charges)} 笔扣款合计 {total_charged / 100:.2f} 元，"
+                       f"超出订单金额 {overcharge / 100:.2f} 元，申请退还多收金额"),
             "charge_ids": [charge["charge_id"] for charge in charges],
         }
         context["proposal"] = proposal
         await self._activate(run.id, StepKey.APPROVAL_GATE.value)
-        return StepOutcome(output={"proposal": proposal})
+        return StepOutcome(input={"order_id": proposal["order_id"],
+                                  "amount_cents": proposal["amount_cents"]},
+                           output={"proposal": proposal})
 
     async def _step_approval_gate(self, run: Run, context: dict, step: RunStep) -> StepOutcome:
         """审批门：显式三分支（P0-1）。
@@ -845,9 +960,11 @@ class TaskEngine:
             await self._release_lease(run)
             context["_finished"] = True
             return StepOutcome()
-        # APPROVED：显式分支才激活退款提交
+        # APPROVED：显式分支才激活退款提交；执行层再次校验禁止自批
+        self._ensure_not_self_approved(run, approval)
         await self._activate(run.id, StepKey.SUBMIT_REFUND.value)
-        return StepOutcome(output={"approved_by": approval.decided_by,
+        return StepOutcome(input={"approved_by": approval.decided_by},
+                           output={"approved_by": approval.decided_by,
                                    "risk_summary": approval.risk_summary})
 
     async def _step_submit_refund(self, run: Run, context: dict, step: RunStep) -> StepOutcome:
@@ -860,8 +977,7 @@ class TaskEngine:
         # 执行写工具前持久化幂等键，重试复用相同键（9.2 节）
         await self._store.set_step_idempotency_key(
             run.id, step.step_key, key,
-            event_type="TOOL_ATTEMPTED",
-            event_payload={"tool": "submit_refund",
+            event_type="TOOL_ATTEMPTED", event_payload={"tool": "submit_refund",
                            "idempotency_key_hash": hashlib.sha256(key.encode()).hexdigest()[:16]})
         try:
             spec = self._tool_registry["submit_refund"]
@@ -872,6 +988,17 @@ class TaskEngine:
                 {"user_id": run.user_id})
         except ToolTimeoutError as ex:
             return await self._pause_for_retry(run, context, step, "tool_timeout", str(ex))
+        except RefundLimitExceeded as ex:
+            # 订单级累计限额：跨 Run 重复退款闸门，副作用未发生，按业务失败收敛
+            raise StepFailure(
+                str(ex), "refund_limit_exceeded",
+                answer="该订单的可退款金额已被其他退款占用，本次不重复退款。"
+                       "请核对退款记录或联系人工客服。") from ex
+        except RefundConflictError as ex:
+            # 归属/参数冲突等业务拒绝：不进入自动退款
+            raise StepFailure(
+                f"退款请求被拒绝: {ex}", "refund_conflict",
+                answer="退款请求被拒绝，本次不执行退款。请核对订单信息或联系人工客服。") from ex
         except BillingUnavailable as ex:
             # P1-2：账单系统瞬时不可用（副作用未发生）→ 安全可重试，落 PAUSED 而非死 FAILED
             return await self._pause_for_retry(run, context, step, "billing_unavailable", str(ex))
@@ -890,8 +1017,12 @@ class TaskEngine:
             return StepOutcome()
         context["refund"] = record
         await self._activate(run.id, StepKey.POLL_REFUND_STATUS.value)
-        return StepOutcome(output={"refund_operation_id": record["operation_id"]},
-                           evidence={"refund": record})
+        return StepOutcome(
+            input={"order_id": proposal["order_id"],
+                   "amount_cents": proposal["amount_cents"],
+                   "operation_id_hash": hashlib.sha256(key.encode()).hexdigest()[:16]},
+            output={"refund_operation_id": record["operation_id"]},
+            evidence={"refund": record})
 
     async def _step_poll_refund_status(self, run: Run, context: dict, step: RunStep) -> StepOutcome:
         """查询退款最终状态；对账恢复时从 SUBMIT_REFUND 步骤的幂等键重建记录。"""
@@ -921,28 +1052,30 @@ class TaskEngine:
         context["refund"] = record
         context["refund_status"] = record["status"]
         await self._activate(run.id, StepKey.BUILD_FINAL_ANSWER.value)
-        return StepOutcome(output={"refund": record}, evidence={"refund": record})
+        return StepOutcome(
+            input={"operation_id_hash":
+                   hashlib.sha256(record["operation_id"].encode()).hexdigest()[:16]},
+            output={"refund": record}, evidence={"refund": record})
 
     async def _step_build_final_answer(self, run: Run, context: dict, step: RunStep) -> StepOutcome:
         """退款成功后的最终回答。回答同时持久化到 Step output（P0 恢复窗口）。"""
-        order = context.get("order", {})
         proposal = context.get("proposal", {})
         amount = proposal.get("amount_cents", 0) / 100
         answer = (
-            f"退款已处理完成：订单 {order.get('order_id')} 重复扣款多收的 {amount:.2f} 元"
-            "已原路退回，退款状态：已成功到账。如有疑问欢迎随时咨询。"
+            f"退款已处理完成：重复扣款多收的 {amount:.2f} 元已原路退回，"
+            "退款状态：已成功到账。如有疑问欢迎随时咨询。"
         )
         return StepOutcome(output={"answer": answer, "collected": context.get("collected", {})},
                            evidence={"refund_status": context.get("refund_status", "succeeded")},
                            answer=answer)
 
     async def _step_no_refund_answer(self, run: Run, context: dict, step: RunStep) -> StepOutcome:
-        """不重复扣款分支的最终回答：解释 + 证据 + 后续建议（8.2 节）。"""
-        order = context.get("order", {})
+        """不重复扣款/未多收分支的最终回答：解释 + 证据 + 后续建议（8.2 节）。"""
         charges = context.get("charges", [])
+        total_charged = sum(charge["amount_cents"] for charge in charges)
         answer = (
-            f"经核对，订单 {order.get('order_id')} 共有 {len(charges)} 笔扣款记录，"
-            "金额与渠道均正常，没有发现重复扣款，无需发起退款。"
+            f"经核对，共有 {len(charges)} 笔扣款记录，合计 {total_charged / 100:.2f} 元，"
+            "未发现超过订单金额的多收款项，无需发起退款。"
             "如仍有疑问，可以提供支付凭证，我们会进一步核实。"
         )
         return StepOutcome(output={"answer": answer, "collected": context.get("collected", {})},

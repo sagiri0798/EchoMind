@@ -93,8 +93,7 @@ async def test_eval_case(case, tmp_path):
             run = await store.get_run(run.id)
         elif action == "cancel":
             run = await store.update_run_status(run.id, run.version, RunStatus.CANCELLED,
-                                                event_type="RUN_CANCELLED",
-                                                event_payload={"by": "user"})
+                                                event_type="RUN_CANCELLED", event_payload={"by": "user"})
         elif action == "recover":
             expire_lease(store, run.id)
             recovered = await TaskRecovery(store, billing).scan()

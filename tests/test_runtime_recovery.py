@@ -297,6 +297,28 @@ async def test_stuck_write_step_without_idempotency_key_retries_safely(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_outcome_unknown_reconcile_success_commits_transcript_once(tmp_path):
+    """真实路径：OUTCOME_UNKNOWN → 对账远端 succeeded → SUCCEEDED，会话仅提交一次、退款仅 1 笔。"""
+    env = await make_env(tmp_path)
+    run = await advance_to_waiting_approval(env)
+    await approve(env, run)
+    env.billing.enable_fault(FAIL_AFTER_EFFECT_BEFORE_RESPONSE)
+    await env.engine.run(run.id)
+    crashed = await env.store.get_run(run.id)
+    assert crashed.status == RunStatus.OUTCOME_UNKNOWN
+    assert env.committed == []  # 未完成前不提交会话
+
+    expire_lease(env.store.path, run.id)
+    await env.engine.run(run.id)
+
+    final = await env.store.get_run(run.id)
+    assert final.status == RunStatus.SUCCEEDED
+    assert final.transcript_committed is True
+    assert len(env.committed) == 1  # 最终回答只提交一次
+    assert refund_count(env.billing) == 1  # 对账成功不重复退款
+
+
+@pytest.mark.asyncio
 async def test_succeeded_but_uncommitted_transcript_is_recovered_once(tmp_path):
     env = await make_env(tmp_path)
     run = await advance_to_waiting_approval(env)
@@ -345,7 +367,7 @@ async def test_crash_between_step_and_run_success_rebuilds_answer(tmp_path, monk
     assert run.status == RunStatus.RUNNING  # 终态未写
     step = await env.store.get_step(run.id, "BUILD_NO_REFUND_ANSWER")
     assert step.status == StepStatus.SUCCEEDED
-    assert "没有发现重复扣款" in step.output_json["answer"]  # 回答已持久化到 Step 输出
+    assert "未发现超过订单金额的多收" in step.output_json["answer"]  # 回答已持久化到 Step 输出
 
     monkeypatch.setattr(env.store, "update_run_status", original)
     expire_lease(env.store.path, run.id)
@@ -355,7 +377,7 @@ async def test_crash_between_step_and_run_success_rebuilds_answer(tmp_path, monk
 
     final = await env.store.get_run(run.id)
     assert final.status == RunStatus.SUCCEEDED
-    assert "没有发现重复扣款" in final.response_json["response"]
+    assert "未发现超过订单金额的多收" in final.response_json["response"]
     assert final.error_code != "plan_exhausted"
 
 
@@ -389,7 +411,7 @@ async def test_partial_skip_recovery_reruns_tolerantly(tmp_path):
 
     final = await env.store.get_run(run.id)
     assert final.status == RunStatus.SUCCEEDED
-    assert "没有发现重复扣款" in final.response_json["response"]
+    assert "未发现超过订单金额的多收" in final.response_json["response"]
 
 
 # ── cancel 与 resume 并发（13.2 #15）────────────────────

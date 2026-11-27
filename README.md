@@ -199,6 +199,7 @@ docker compose --env-file ../EchoMind/.env up -d --build
 | `ECHOMIND_API_TOKENS` | 访问 Token 与用户、角色的 JSON 映射，见部署章节。 |
 | `ECHOMIND_RUNTIME_DB` | 任务运行时（/runs）的 SQLite 文件路径，默认 `data/runtime/runtime.db`。 |
 | `ECHOMIND_BILLING_DB` | 沙箱账单系统的 SQLite 文件路径，默认 `data/runtime/sandbox_billing.db`。 |
+| `ECHOMIND_RUNTIME_ALLOW_ANONYMOUS_APPROVAL` | 无认证环境下设为 `1` 才允许匿名审批（仅限 `anonymous` 用户的 Run）；默认拒绝（403），仅供本地调试。 |
 
 `APP_ENV` 与 `ECHOMIND_ENV` 用途不同：前者控制 `python api/main.py` 的开发热重载，后者控制生产鉴权要求。Docker 镜像通过 Uvicorn 启动，监听地址和端口由镜像命令指定；修改 `API_HOST`、`API_PORT` 不会改变 Compose 的端口映射。
 
@@ -585,12 +586,27 @@ SQLite 数据库模拟，不接真实支付系统；知识检索复用现有知�
 
 - 沙箱账单数据只用于演示与测试，**不是真实支付/退款系统**；
 - 目标是「外部副作用至多一次，结果最终可确认」，**不是 exactly-once**；
-- v1 为固定 DAG，不做自由 Planner；金额/时间一致性不做业务校验（以实际扣款
-  记录为准），时间窗政策校验未实现；
+- v1 为固定 DAG，不做自由 Planner；用户声称的金额/支付时间会与扣款记录比对
+  （绝对日期不一致即失败；相对日期无法确定性比对时跳过），时间窗政策校验未实现；
 - 故障注入（`FAIL_BEFORE_EFFECT` 等）仅测试可用，生产代码路径不读取用户可控参数。
 
 典型流程：`POST /runs` 创建 → 轮询 `GET /runs/{id}` → 缺信息时 `resume` 补充 →
 `approval` 审批（通过后自动提交退款并轮询状态，拒绝则不执行退款）。
+
+审批与退款权限：
+
+- 有认证身份时，任何角色（含 admin）都不能审批自己发起的 Run（403）；admin 可审批
+  他人 Run；非所有者访问他人 Run 一律 404（隐藏资源存在性）。存储层与引擎执行层都会
+  强制拒绝自批记录，不只依赖 API 校验。
+- `/runs` 的 `task_type` 仅接受 `duplicate_charge_refund`（其他值返回 422）。
+- 退款提交带订单级累计闸门：可退上限 = 多收金额 = max(0, 所有扣款合计 - 订单金额)；
+  同一订单所有非 `failed` 退款（submitted/processing/succeeded）累计不得超过该上限。
+  单笔超过可退上限时记为 `failed` 终态；总扣款未超过订单金额时走不退款分支。
+  9.2 的 Run/Step 级幂等键保持不变，订单级校验是额外业务闸门。
+- 无认证身份的本地开发模式默认拒绝匿名审批（403）；仅当
+  `ECHOMIND_RUNTIME_ALLOW_ANONYMOUS_APPROVAL=1` 且 Run 属于 `anonymous` 用户时允许。
+  `anonymous` 是无认证本地模式的保留 user_id，鉴权 Token 不应使用该值。
+  生产部署必须开启鉴权（`ECHOMIND_API_TOKENS`）。
 
 ### 故障排查
 

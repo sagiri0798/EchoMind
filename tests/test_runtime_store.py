@@ -18,6 +18,7 @@ from runtime.store import (
     LeaseLostError,
     RunNotFoundError,
     RunStore,
+    SelfApprovalDeniedError,
     StepExistsError,
     StepNotFoundError,
     VersionConflictError,
@@ -361,3 +362,103 @@ async def test_bootstrap_is_idempotent(store, tmp_path):
     db2 = RunStore(tmp_path / "runtime.db")
     await db2.bootstrap()  # 第二次启动不报错，且原数据仍在
     assert (await db2.get_run(run.id)).id == run.id
+
+
+@pytest.mark.asyncio
+async def test_illegal_transition_writes_rejection_event(store):
+    """S5/5.3：非法 Run/Step 转换与版本冲突被拒绝时，必须留下 TRANSITION_REJECTED 事件。"""
+    run = await store.create_run(**make_run_fields())
+    with pytest.raises(IllegalTransitionError):
+        await store.update_run_status(run.id, 0, RunStatus.SUCCEEDED)
+    rejected = [e for e in await store.get_events(run.id)
+                if e.event_type == "TRANSITION_REJECTED"]
+    assert rejected, "非法 Run 转换必须写 Event"
+    assert rejected[-1].payload_json["reason"] == "illegal_transition"
+    assert rejected[-1].payload_json["from"] == "CREATED"
+    assert rejected[-1].payload_json["to"] == "SUCCEEDED"
+
+    # 版本冲突同样留痕
+    with pytest.raises(VersionConflictError):
+        await store.update_run_status(run.id, 99, RunStatus.RUNNING)
+    rejected = [e for e in await store.get_events(run.id)
+                if e.event_type == "TRANSITION_REJECTED"]
+    assert rejected[-1].payload_json["reason"] == "version_conflict"
+
+    # 非法 Step 转换（READY → SUCCEEDED）留痕，并带 step_key
+    await store.create_steps(run.id, [make_step_fields("LOAD_ORDER", 0)])
+    await store.update_step_status(run.id, "LOAD_ORDER",
+                                   StepStatus.PENDING, StepStatus.READY)
+    with pytest.raises(IllegalTransitionError):
+        await store.update_step_status(run.id, "LOAD_ORDER",
+                                       StepStatus.READY, StepStatus.SUCCEEDED)
+    rejected = [e for e in await store.get_events(run.id)
+                if e.event_type == "TRANSITION_REJECTED" and e.step_key == "LOAD_ORDER"]
+    assert rejected and rejected[-1].payload_json["reason"] == "illegal_transition"
+
+
+@pytest.mark.asyncio
+async def test_empty_json_dicts_roundtrip_without_binding_error(store):
+    """审查 LOW：空 dict 的 JSON 字段必须序列化为 '{}'，不能把 dict 原样绑定给 SQLite。"""
+    run = await store.create_run(**make_run_fields(result_json={}, response_json={}))
+    run = await store.update_run_status(run.id, 0, RunStatus.RUNNING)
+    assert run.result_json == {} and run.response_json == {}
+    stored = await store.get_run(run.id)
+    assert stored.result_json == {} and stored.response_json == {}
+
+    await store.create_steps(run.id, [RunStep(
+        run_id="", step_key="LOAD_ORDER", ordinal=0, status=StepStatus.PENDING,
+        input_json={}, output_json={}, evidence_json={})])
+    step = await store.update_step_status(run.id, "LOAD_ORDER",
+                                          StepStatus.PENDING, StepStatus.READY)
+    assert step.input_json == {} and step.output_json == {} and step.evidence_json == {}
+    stored_step = await store.get_step(run.id, "LOAD_ORDER")
+    assert stored_step.input_json == {}
+    assert stored_step.output_json == {}
+    assert stored_step.evidence_json == {}
+
+
+# ── 审批禁止自批（存储层强制）───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_store_rejects_self_approval_and_empty_identity(store):
+    """store 层强制：decided_by 不能为空、不能等于 run.user_id；admin 可以审批。"""
+    from runtime.models import ApprovalDecision
+    run = await store.create_run(**make_run_fields(user_id="u1"))
+    await store.create_approval(run.id, "APPROVAL_GATE", "风险摘要")
+
+    with pytest.raises(SelfApprovalDeniedError):
+        await store.decide_approval(run.id, "APPROVAL_GATE",
+                                    ApprovalDecision.APPROVED, decided_by="u1")
+    with pytest.raises(SelfApprovalDeniedError):
+        await store.decide_approval(run.id, "APPROVAL_GATE",
+                                    ApprovalDecision.APPROVED, decided_by="")
+    # 匿名身份不能审批非 anonymous 用户的 Run
+    with pytest.raises(SelfApprovalDeniedError):
+        await store.decide_approval(run.id, "APPROVAL_GATE",
+                                    ApprovalDecision.APPROVED, decided_by="anonymous")
+    pending = await store.get_approval(run.id, "APPROVAL_GATE")
+    assert pending.decision == ApprovalDecision.PENDING
+
+    await store.decide_approval(run.id, "APPROVAL_GATE",
+                                ApprovalDecision.APPROVED, decided_by="admin")
+    assert (await store.get_approval(run.id, "APPROVAL_GATE")).decision \
+        == ApprovalDecision.APPROVED
+
+
+@pytest.mark.asyncio
+async def test_store_anonymous_self_approval_requires_explicit_switch(store, monkeypatch):
+    """匿名本地自批仅在 ECHOMIND_RUNTIME_ALLOW_ANONYMOUS_APPROVAL=1 时豁免。"""
+    from runtime.models import ApprovalDecision
+    monkeypatch.delenv("ECHOMIND_RUNTIME_ALLOW_ANONYMOUS_APPROVAL", raising=False)
+    run = await store.create_run(**make_run_fields(user_id="anonymous"))
+    await store.create_approval(run.id, "APPROVAL_GATE", "风险摘要")
+
+    with pytest.raises(SelfApprovalDeniedError):
+        await store.decide_approval(run.id, "APPROVAL_GATE",
+                                    ApprovalDecision.APPROVED, decided_by="anonymous")
+    monkeypatch.setenv("ECHOMIND_RUNTIME_ALLOW_ANONYMOUS_APPROVAL", "1")
+    await store.decide_approval(run.id, "APPROVAL_GATE",
+                                ApprovalDecision.APPROVED, decided_by="anonymous")
+    assert (await store.get_approval(run.id, "APPROVAL_GATE")).decision \
+        == ApprovalDecision.APPROVED

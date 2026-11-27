@@ -1,7 +1,7 @@
 {
   "suite": "refund-v1",
   "task_type": "duplicate_charge_refund",
-  "说明": "确定性退款评测集（实施计划 13.3 节）。所有依赖均为沙箱：SQLite 账单数据、假知识库工具；不调用真实模型、真实支付或外网。金额/时间一致性校验已实现：与扣款记录不符时不自动退款（以实际扣款记录为准）。",
+  "说明": "确定性退款评测集（实施计划 13.3 节）。所有依赖均为沙箱：SQLite 账单数据、假知识库工具；不调用真实模型、真实支付或外网。金额/时间一致性校验已实现：与扣款记录不符时不自动退款（以实际扣款记录为准）。重复扣款退款上限按「多收金额 = 总扣款 - 订单金额」计算；总扣款未超过订单金额时不退款。",
   "cases": [
     {
       "id": "normal_refund",
@@ -17,6 +17,7 @@
         "tools_called": ["submit_refund"],
         "approval_decision": "approved",
         "refund_count": 1,
+        "refund_amount_cents": 9900,
         "answer_contains": ["退款", "已原路退回"]
       }
     },
@@ -81,7 +82,7 @@
         "key_steps": ["BUILD_NO_REFUND_ANSWER"],
         "tools_not_called": ["search_knowledge_base", "submit_refund"],
         "refund_count": 0,
-        "answer_contains": ["没有发现重复扣款"]
+        "answer_contains": ["未发现超过订单金额的多收"]
       }
     },
     {

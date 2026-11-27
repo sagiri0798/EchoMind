@@ -74,7 +74,25 @@ class BillingOutcomeUnknown(RuntimeError):
 
 
 class RefundConflictError(RuntimeError):
-    """同一 operation_id 携带不同参数重复提交。"""
+    """同一 operation_id 携带不同参数重复提交，或退款请求不合法。"""
+
+
+class RefundLimitExceeded(RefundConflictError):
+    """退款金额非法或超过订单可退上限（多收金额，跨 Run 业务闸门）。"""
+
+    def __init__(self, order_id: str, reserved_cents: int, amount_cents: int,
+                 limit_cents: int):
+        if amount_cents <= 0:
+            message = "退款金额必须大于 0"
+        else:
+            message = (
+                f"退款金额超出可退上限：已占用 {reserved_cents / 100:.2f} 元"
+                f" + 本次 {amount_cents / 100:.2f} 元 > 可退 {limit_cents / 100:.2f} 元")
+        super().__init__(message)
+        self.order_id = order_id
+        self.reserved_cents = reserved_cents
+        self.amount_cents = amount_cents
+        self.limit_cents = limit_cents
 
 
 class SandboxBillingClient:
@@ -184,29 +202,54 @@ class SandboxBillingClient:
             self._fault = None
             raise BillingUnavailable("故障注入：提交前失败（副作用未发生）")
         with self._connect() as conn:
+            # 订单级累计限额与写入必须处于同一写事务：BEGIN IMMEDIATE 串行化并发提交，
+            # 避免两个 Run 同时通过校验后各自写入造成超卖。
+            conn.execute("BEGIN IMMEDIATE")
             order = conn.execute(
                 "SELECT * FROM orders WHERE order_id=? AND user_id=?", (order_id, user_id)
             ).fetchone()
             if order is None:
-                raise RefundConflictError(f"订单不存在或不属于用户: {order_id}")
+                conn.execute("ROLLBACK")
+                raise RefundConflictError("订单不存在或不属于当前用户")
             existing = conn.execute(
                 "SELECT * FROM refunds WHERE operation_id=?", (operation_id,)
             ).fetchone()
             if existing is not None:
+                conn.execute("ROLLBACK")  # 只读幂等重放，不产生新写入
                 if (existing["order_id"], existing["user_id"], existing["amount_cents"]) \
                         != (order_id, user_id, amount_cents):
                     raise RefundConflictError("同一 operation_id 不能用于不同参数")
                 return _row_dict(existing)  # 幂等：返回相同退款记录
-            conn.execute("BEGIN IMMEDIATE")
             now = datetime.now().isoformat()
-            # 业务校验（确定性）：退款金额超过订单金额 → 直接落为 failed 终态
-            if amount_cents > order["amount_cents"]:
+            if amount_cents <= 0:
+                conn.execute("ROLLBACK")
+                raise RefundLimitExceeded(order_id, 0, amount_cents, 0)
+            # 可退上限 = 订单多收金额（总扣款 - 订单金额），不是订单金额本身。
+            charges_total = conn.execute(
+                "SELECT COALESCE(SUM(amount_cents), 0) FROM charges "
+                "WHERE order_id=? AND user_id=?",
+                (order_id, user_id)
+            ).fetchone()[0]
+            overcharge = max(0, charges_total - order["amount_cents"])
+            if amount_cents > overcharge:
+                # 单笔超过可退上限：保留 failed 终态（S10：10000 > 9900）。
+                # 不误判为「超过订单金额」：订单 1000 + 两笔 1500（多收 2000）时 1500 合法。
                 status = "failed"
-            elif self._fault == DELAYED_SUCCESS:
-                status = "processing"
-                self._fault = None  # 一次性注入：代表外部系统处理较慢
             else:
-                status = "submitted"
+                # 跨 Run 汇总同一订单所有非 failed 退款；failed 不计入，允许失败后重试。
+                reserved = conn.execute(
+                    "SELECT COALESCE(SUM(amount_cents), 0) FROM refunds "
+                    "WHERE order_id=? AND user_id=? AND status != 'failed'",
+                    (order_id, user_id)
+                ).fetchone()[0]
+                if reserved + amount_cents > overcharge:
+                    conn.execute("ROLLBACK")
+                    raise RefundLimitExceeded(order_id, reserved, amount_cents, overcharge)
+                if self._fault == DELAYED_SUCCESS:
+                    status = "processing"
+                    self._fault = None  # 一次性注入：代表外部系统处理较慢
+                else:
+                    status = "submitted"
             conn.execute(
                 "INSERT INTO refunds (operation_id, order_id, user_id, amount_cents, reason, "
                 "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
