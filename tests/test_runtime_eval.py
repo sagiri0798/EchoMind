@@ -15,7 +15,7 @@ import pytest_asyncio
 
 from runtime.billing import SandboxBillingClient, demo_seed
 from runtime.engine import TaskEngine
-from runtime.models import ApprovalDecision, RunStatus, StepStatus
+from runtime.models import ApprovalDecision, EventSpec, RunStatus, StepStatus
 from runtime.recovery import TaskRecovery
 from runtime.store import RunStore
 
@@ -83,17 +83,17 @@ async def test_eval_case(case, tmp_path):
             await store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.APPROVED,
                                         decided_by="admin")
             run = await store.update_run_status(run.id, run.version, RunStatus.RUNNING,
-                                                event_type="RUN_RESUMED")
+                                                event=EventSpec("RUN_RESUMED"))
         elif action == "reject":
             await store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.REJECTED,
                                         decided_by="admin")
             run = await store.update_run_status(run.id, run.version, RunStatus.RUNNING,
-                                                event_type="RUN_RESUMED")
+                                                event=EventSpec("RUN_RESUMED"))
             await engine.run(run.id)
             run = await store.get_run(run.id)
         elif action == "cancel":
             run = await store.update_run_status(run.id, run.version, RunStatus.CANCELLED,
-                                                event_type="RUN_CANCELLED", event_payload={"by": "user"})
+                                                event=EventSpec("RUN_CANCELLED", {"by": "user"}))
         elif action == "recover":
             expire_lease(store, run.id)
             recovered = await TaskRecovery(store, billing).scan()

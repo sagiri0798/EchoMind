@@ -12,7 +12,7 @@ import pytest_asyncio
 
 from runtime.billing import SandboxBillingClient, demo_seed
 from runtime.engine import TaskEngine
-from runtime.models import RunStatus, StepStatus
+from runtime.models import EventSpec, RunStatus, StepStatus
 from runtime.plans import plan_for
 from runtime.store import RunStore
 
@@ -208,7 +208,7 @@ async def test_approved_refund_flow_submits_once_and_succeeds(env):
     await env.store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.APPROVED,
                                     decided_by="admin")
     await env.store.update_run_status(run.id, run.version, RunStatus.RUNNING,
-                                      event_type="RUN_RESUMED")
+                                      event=EventSpec("RUN_RESUMED"))
     await env.engine.run(run.id)
 
     final = await env.store.get_run(run.id)
@@ -273,7 +273,7 @@ async def test_tool_timeout_pauses_and_recovers(env):
     registry["search_knowledge_base"] = replace(spec, timeout_s=10.0, handler=fast)
     env.engine._tool_registry = registry
     paused = await env.store.update_run_status(paused.id, paused.version, RunStatus.RUNNING,
-                                               event_type="RUN_RESUMED")
+                                               event=EventSpec("RUN_RESUMED"))
     await env.engine.run(run.id)
     final = await env.store.get_run(run.id)
     assert final.status == RunStatus.WAITING_APPROVAL  # 恢复后正常推进到审批
@@ -293,7 +293,7 @@ async def test_billing_unavailable_pauses_and_recovers(env):
     await env.store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.APPROVED,
                                     decided_by="admin")
     await env.store.update_run_status(run.id, run.version, RunStatus.RUNNING,
-                                      event_type="RUN_RESUMED")
+                                      event=EventSpec("RUN_RESUMED"))
     env.billing.enable_fault(FAIL_BEFORE_EFFECT)
     await env.engine.run(run.id)
 
@@ -309,7 +309,7 @@ async def test_billing_unavailable_pauses_and_recovers(env):
 
     # resume 恢复（API 语义：PAUSED → RUNNING + 调度）
     paused = await env.store.update_run_status(paused.id, paused.version, RunStatus.RUNNING,
-                                               event_type="RUN_RESUMED")
+                                               event=EventSpec("RUN_RESUMED"))
     await env.engine.run(run.id)
     final = await env.store.get_run(run.id)
     assert final.status == RunStatus.SUCCEEDED
@@ -327,7 +327,7 @@ async def test_engine_rerun_after_success_keeps_single_external_write(env):
     await env.store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.APPROVED,
                                     decided_by="admin")
     await env.store.update_run_status(run.id, run.version, RunStatus.RUNNING,
-                                      event_type="RUN_RESUMED")
+                                      event=EventSpec("RUN_RESUMED"))
     await env.engine.run(run.id)
     # 13.2 #5：完成后再次调度引擎，不产生第二次外部写
     await env.engine.run(run.id)
@@ -348,7 +348,7 @@ async def test_two_concurrent_resumes_only_one_executes(env):
     run = await env.store.get_run(run.id)
     run = await env.store.append_run_input(run.id, run.version, "还是没有订单号")
     run = await env.store.update_run_status(run.id, run.version, RunStatus.RUNNING,
-                                            event_type="RUN_RESUMED")
+                                            event=EventSpec("RUN_RESUMED"))
 
     engine2 = TaskEngine(env.store, env.billing,
                          tools={"search_knowledge_base": env.engine._tools["search_knowledge_base"]})
@@ -411,7 +411,7 @@ async def test_cancel_after_refund_succeeded_completes_run(env):
     await env.store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.APPROVED,
                                     decided_by="admin")
     run = await env.store.update_run_status(run.id, run.version, RunStatus.RUNNING,
-                                            event_type="RUN_RESUMED")
+                                            event=EventSpec("RUN_RESUMED"))
     original_execute = env.engine._execute_step
     fired = []
 
@@ -445,7 +445,7 @@ async def test_cancel_with_refund_in_flight_holds_outcome_unknown(env):
     await env.store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.APPROVED,
                                     decided_by="admin")
     run = await env.store.update_run_status(run.id, run.version, RunStatus.RUNNING,
-                                            event_type="RUN_RESUMED")
+                                            event=EventSpec("RUN_RESUMED"))
     env.billing.enable_fault(FAIL_AFTER_EFFECT_BEFORE_RESPONSE)
     await env.engine.run(run.id)  # 副作用已发生、响应丢失 → OUTCOME_UNKNOWN
     assert (await env.store.get_run(run.id)).status == RunStatus.OUTCOME_UNKNOWN
@@ -500,7 +500,7 @@ async def test_resume_uses_injected_entity_extractor(tmp_path):
     run = await store.append_run_input(run.id, run.version,
                                        "补充：订单号 #12345，99 元，昨天支付")
     run = await store.update_run_status(run.id, run.version, RunStatus.RUNNING,
-                                        event_type="RUN_RESUMED")
+                                        event=EventSpec("RUN_RESUMED"))
     await engine.run(run.id)
 
     final = await store.get_run(run.id)
@@ -589,7 +589,7 @@ async def test_second_run_on_same_order_cannot_refund_again(env):
                                         ApprovalDecision.APPROVED, decided_by="admin")
         current = await env.store.update_run_status(
             run.id, current.version, RunStatus.RUNNING,
-            event_type="RUN_RESUMED")
+            event=EventSpec("RUN_RESUMED"))
         await env.engine.run(run.id)
         return await env.store.get_run(run.id)
 
@@ -614,7 +614,7 @@ async def approve_and_run(env, run):
                                     ApprovalDecision.APPROVED, decided_by="admin")
     current = await env.store.update_run_status(
         run.id, current.version, RunStatus.RUNNING,
-        event_type="RUN_RESUMED")
+        event=EventSpec("RUN_RESUMED"))
     await env.engine.run(run.id)
     return await env.store.get_run(run.id)
 
@@ -773,7 +773,7 @@ async def test_engine_refuses_legacy_self_approved_record(env):
 
     current = await env.store.get_run(run.id)
     current = await env.store.update_run_status(
-        run.id, current.version, RunStatus.RUNNING, event_type="RUN_RESUMED")
+        run.id, current.version, RunStatus.RUNNING, event=EventSpec("RUN_RESUMED"))
     await env.engine.run(run.id)
 
     final = await env.store.get_run(run.id)
@@ -792,7 +792,7 @@ async def test_engine_refuses_legacy_approval_without_identity(env):
 
     current = await env.store.get_run(run.id)
     current = await env.store.update_run_status(
-        run.id, current.version, RunStatus.RUNNING, event_type="RUN_RESUMED")
+        run.id, current.version, RunStatus.RUNNING, event=EventSpec("RUN_RESUMED"))
     await env.engine.run(run.id)
 
     final = await env.store.get_run(run.id)
@@ -811,7 +811,7 @@ async def test_engine_refuses_legacy_anonymous_approval_on_other_users_run(env):
 
     current = await env.store.get_run(run.id)
     current = await env.store.update_run_status(
-        run.id, current.version, RunStatus.RUNNING, event_type="RUN_RESUMED")
+        run.id, current.version, RunStatus.RUNNING, event=EventSpec("RUN_RESUMED"))
     await env.engine.run(run.id)
 
     final = await env.store.get_run(run.id)

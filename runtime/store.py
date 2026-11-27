@@ -18,6 +18,7 @@ from typing import Any, Iterator, Optional
 
 from runtime.models import (
     ApprovalDecision,
+    EventSpec,
     Run,
     RunApproval,
     RunEvent,
@@ -461,8 +462,7 @@ class RunStore:
         response_json: Optional[dict] = None,
         error_code: Optional[str] = None,
         retryable: Optional[bool] = None,
-        event_type: Optional[str] = None,
-        event_payload: Optional[dict] = None,
+        event: Optional[EventSpec] = None,
     ) -> Run:
         """原子状态转换：校验版本、合法转换与租约后，更新状态并（可选）写事件。
 
@@ -471,12 +471,12 @@ class RunStore:
         return await asyncio.to_thread(
             self._update_run_status, run_id, expected_version, next_status,
             current_step, lease_owner, result_json, response_json, error_code, retryable,
-            event_type, event_payload,
+            event,
         )
 
     def _update_run_status(self, run_id, expected_version, next_status, current_step,
                            lease_owner, result_json, response_json, error_code, retryable,
-                           event_type, event_payload) -> Run:
+                           event) -> Run:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             run = self._load_run_for_write(conn, run_id)
@@ -509,8 +509,8 @@ class RunStore:
                     run_id,
                 ),
             )
-            if event_type:
-                self._insert_event(conn, run_id, event_type, current_step, event_payload)
+            if event is not None:
+                self._insert_event(conn, run_id, event.type, current_step, event.payload)
             conn.execute("COMMIT")
         return dataclasses.replace(
             run,
@@ -754,8 +754,7 @@ class RunStore:
         output_json: Optional[dict] = None,
         evidence_json: Optional[dict] = None,
         error_code: Optional[str] = None,
-        event_type: Optional[str] = None,
-        event_payload: Optional[dict] = None,
+        event: Optional[EventSpec] = None,
         checkpoint: Optional[dict] = None,
     ) -> RunStep:
         """Step 状态转换：期望状态不匹配（CAS）或转换非法时拒绝，事务回滚。
@@ -767,12 +766,12 @@ class RunStore:
         return await asyncio.to_thread(
             self._update_step_status, run_id, step_key, expected_status, next_status,
             attempt, idempotency_key, input_json, output_json, evidence_json, error_code,
-            event_type, event_payload, checkpoint,
+            event, checkpoint,
         )
 
     def _update_step_status(self, run_id, step_key, expected_status, next_status, attempt,
                             idempotency_key, input_json, output_json, evidence_json, error_code,
-                            event_type, event_payload, checkpoint) -> RunStep:
+                            event, checkpoint) -> RunStep:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -823,8 +822,8 @@ class RunStore:
                     step_key,
                 ),
             )
-            if event_type:
-                self._insert_event(conn, run_id, event_type, step_key, event_payload)
+            if event is not None:
+                self._insert_event(conn, run_id, event.type, step_key, event.payload)
             if checkpoint is not None:
                 self._insert_event(conn, run_id, "CHECKPOINT_COMMITTED", step_key, checkpoint)
             conn.execute("COMMIT")
@@ -842,13 +841,12 @@ class RunStore:
         )
 
     async def set_step_idempotency_key(self, run_id: str, step_key: str, key: str, *,
-                                       event_type: Optional[str] = None,
-                                       event_payload: Optional[dict] = None) -> RunStep:
+                                       event: Optional[EventSpec] = None) -> RunStep:
         """执行写工具前持久化幂等键（9.2 节），不改变 Step 状态。"""
         return await asyncio.to_thread(
-            self._set_step_idempotency_key, run_id, step_key, key, event_type, event_payload)
+            self._set_step_idempotency_key, run_id, step_key, key, event)
 
-    def _set_step_idempotency_key(self, run_id, step_key, key, event_type, event_payload) -> RunStep:
+    def _set_step_idempotency_key(self, run_id, step_key, key, event) -> RunStep:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -861,8 +859,8 @@ class RunStore:
                 "UPDATE run_steps SET idempotency_key=? WHERE run_id=? AND step_key=?",
                 (key, run_id, step_key),
             )
-            if event_type:
-                self._insert_event(conn, run_id, event_type, step_key, event_payload)
+            if event is not None:
+                self._insert_event(conn, run_id, event.type, step_key, event.payload)
             conn.execute("COMMIT")
         return dataclasses.replace(_step_from_row(row), idempotency_key=key)
 

@@ -32,7 +32,7 @@ from runtime.billing import (
     RefundLimitExceeded,
     SandboxBillingClient,
 )
-from runtime.models import ApprovalDecision, Run, RunStatus, RunStep, StepStatus
+from runtime.models import ApprovalDecision, EventSpec, Run, RunStatus, RunStep, StepStatus
 from runtime.plans import DUP_BRANCH, StepKey, plan_for
 from runtime.policy import anonymous_approval_allowed, can_execute, requires_approval
 from runtime.store import (
@@ -151,15 +151,15 @@ class TaskEngine:
                         await self._store.update_step_status(
                             run_id, step.step_key, StepStatus.RUNNING,
                             StepStatus.OUTCOME_UNKNOWN,
-                            event_type="RECOVERY_SCAN", event_payload={"action": "outcome_unknown"})
+                            event=EventSpec("RECOVERY_SCAN", {"action": "outcome_unknown"}))
                     else:
                         await self._store.update_step_status(
                             run_id, step.step_key, StepStatus.RUNNING, StepStatus.READY,
-                            event_type="RECOVERY_SCAN", event_payload={"action": "retry"})
+                            event=EventSpec("RECOVERY_SCAN", {"action": "retry"}))
                 run = await self._store.update_run_status(
                     run_id, run.version, RunStatus.PAUSED,
                     lease_owner=self._owner, error_code="engine_error", retryable=True,
-                    event_type="RUN_PAUSED", event_payload={"error": str(ex)[:200]},
+                    event=EventSpec("RUN_PAUSED", {"error": str(ex)[:200]}),
                 )
                 await self._release_lease(run)
             except Exception:
@@ -203,7 +203,7 @@ class TaskEngine:
             await self._store.update_run_status(
                 run_id, run.version, RunStatus.FAILED,
                 error_code="unknown_task_type", retryable=False,
-                event_type="RUN_FAILED", event_payload={"error": str(ex)},
+                event=EventSpec("RUN_FAILED", {"error": str(ex)}),
             )
             return
         try:
@@ -215,7 +215,7 @@ class TaskEngine:
         if run.status == RunStatus.CREATED:
             run = await self._store.update_run_status(
                 run_id, run.version, RunStatus.RUNNING,
-                lease_owner=self._owner, event_type="RUN_STARTED",
+                lease_owner=self._owner, event=EventSpec("RUN_STARTED"),
             )
         elif run.status == RunStatus.WAITING_APPROVAL:
             gate_approval = await self._store.get_approval(run_id, StepKey.APPROVAL_GATE.value)
@@ -223,13 +223,13 @@ class TaskEngine:
                 return  # 仍在等待审批，无事可做
             run = await self._store.update_run_status(
                 run_id, run.version, RunStatus.RUNNING,
-                lease_owner=self._owner, event_type="RUN_RESUMED",
+                lease_owner=self._owner, event=EventSpec("RUN_RESUMED"),
             )
             runtime_metrics.record_resume("approval")
         elif run.status in (RunStatus.OUTCOME_UNKNOWN, RunStatus.PAUSED):
             run = await self._store.update_run_status(
                 run_id, run.version, RunStatus.RUNNING,
-                lease_owner=self._owner, event_type="RUN_RESUMED",
+                lease_owner=self._owner, event=EventSpec("RUN_RESUMED"),
             )
             runtime_metrics.record_resume("recovery")
         context: dict = await self._rebuild_context(steps)
@@ -274,14 +274,14 @@ class TaskEngine:
                                 run_id, submit.step_key, StepStatus.READY, StepStatus.RUNNING)
                         submit = await self._store.update_step_status(
                             run_id, submit.step_key, StepStatus.RUNNING, StepStatus.SUCCEEDED,
-                            event_type="RECONCILED", event_payload={"result": "succeeded"})
+                            event=EventSpec("RECONCILED", {"result": "succeeded"}))
                         await self._activate(run_id, StepKey.POLL_REFUND_STATUS.value)
                     elif record is not None and record["status"] not in ("failed",):
                         # submitted/processing/unknown：外部可能已执行，不能取消，等待对账
                         run = await self._store.update_run_status(
                             run_id, run.version, RunStatus.OUTCOME_UNKNOWN,
                             lease_owner=self._owner, current_step=submit.step_key,
-                            event_type="OUTCOME_UNKNOWN", event_payload={"reason": "cancel_reconcile_in_flight"})
+                            event=EventSpec("OUTCOME_UNKNOWN", {"reason": "cancel_reconcile_in_flight"}))
                         runtime_metrics.record_outcome_unknown(run.task_type)
                         await self._release_lease(run)
                         return
@@ -297,10 +297,10 @@ class TaskEngine:
                         if pending.status == StepStatus.PENDING:
                             await self._store.update_step_status(
                                 run_id, pending.step_key, StepStatus.PENDING, StepStatus.SKIPPED,
-                                event_type="STEP_SKIPPED", event_payload={"reason": "cancelled"})
+                                event=EventSpec("STEP_SKIPPED", {"reason": "cancelled"}))
                     run = await self._store.update_run_status(
                         run_id, run.version, RunStatus.CANCELLED,
-                        lease_owner=self._owner, event_type="RUN_CANCELLED", event_payload={"by": "cancel_requested"},
+                        lease_owner=self._owner, event=EventSpec("RUN_CANCELLED", {"by": "cancel_requested"}),
                     )
                     runtime_metrics.record_run_terminal(run.task_type, RunStatus.CANCELLED.value)
                     await self._release_lease(run)
@@ -366,7 +366,7 @@ class TaskEngine:
         step = await self._store.update_step_status(
             run.id, step.step_key, expected, StepStatus.RUNNING,
             attempt=step.attempt + 1,
-            event_type="STEP_STARTED", event_payload={"step": step.step_key},
+            event=EventSpec("STEP_STARTED", {"step": step.step_key}),
         )
         executor = self._executors.get(step.step_key)
         started = time.monotonic()
@@ -379,7 +379,7 @@ class TaskEngine:
             await self._store.update_step_status(
                 run.id, step.step_key, StepStatus.RUNNING, StepStatus.FAILED,
                 error_code=ex.error_code,
-                event_type="STEP_FAILED", event_payload={"error": ex.error_code},
+                event=EventSpec("STEP_FAILED", {"error": ex.error_code}),
                 checkpoint=self._checkpoint_payload(step, StepStatus.FAILED,
                                                     time.monotonic() - started,
                                                     error_code=ex.error_code),
@@ -391,7 +391,7 @@ class TaskEngine:
                 lease_owner=self._owner, error_code=ex.error_code, retryable=False,
                 result_json={"summary": str(ex)},
                 response_json={"response": ex.answer or f"处理失败：{ex}"},
-                event_type="RUN_FAILED", event_payload={"step": step.step_key},
+                event=EventSpec("RUN_FAILED", {"step": step.step_key}),
             )
             runtime_metrics.record_run_terminal(run.task_type, RunStatus.FAILED.value)
             await self._release_lease(run)
@@ -404,7 +404,7 @@ class TaskEngine:
             await self._store.update_step_status(
                 run.id, step.step_key, StepStatus.RUNNING, StepStatus.READY,
                 input_json=outcome.input,
-                event_type="STEP_NEEDS_INPUT", event_payload={"missing": outcome.needs_user_input},
+                event=EventSpec("STEP_NEEDS_INPUT", {"missing": outcome.needs_user_input}),
             )
             runtime_metrics.record_step(step.step_key, StepStatus.READY.value,
                                         time.monotonic() - started)
@@ -412,7 +412,7 @@ class TaskEngine:
                 run.id, run.version, RunStatus.WAITING_USER,
                 current_step=step.step_key, lease_owner=self._owner,
                 result_json={"missing_fields": outcome.needs_user_input},
-                event_type="WAITING_USER_INPUT", event_payload={"missing": outcome.needs_user_input},
+                event=EventSpec("WAITING_USER_INPUT", {"missing": outcome.needs_user_input}),
             )
             await self._release_lease(run)
             context["_finished"] = True
@@ -429,7 +429,7 @@ class TaskEngine:
             run.id, step.step_key, StepStatus.RUNNING, StepStatus.SUCCEEDED,
             input_json=outcome.input if outcome.input is not None else step.input_json,
             output_json=outcome.output, evidence_json=outcome.evidence,
-            event_type="STEP_SUCCEEDED", event_payload={"step": step.step_key},
+            event=EventSpec("STEP_SUCCEEDED", {"step": step.step_key}),
             checkpoint=checkpoint,
         )
         runtime_metrics.record_step(step.step_key, StepStatus.SUCCEEDED.value, duration)
@@ -439,7 +439,7 @@ class TaskEngine:
                 current_step=step.step_key, lease_owner=self._owner,
                 result_json={"collected": context.get("collected", {})},
                 response_json={"response": outcome.answer},
-                event_type="RUN_SUCCEEDED",
+                event=EventSpec("RUN_SUCCEEDED"),
             )
             runtime_metrics.record_run_terminal(run.task_type, RunStatus.SUCCEEDED.value)
             await self._commit_transcript(run, outcome.answer)
@@ -495,28 +495,28 @@ class TaskEngine:
                 # 9.2 节：幂等键在执行写工具前持久化；无键 ⇒ 外部调用从未发出 → 安全重试
                 await self._store.update_step_status(
                     run.id, step.step_key, StepStatus.OUTCOME_UNKNOWN, StepStatus.READY,
-                    event_type="RECONCILED", event_payload={"result": "no_idempotency_key"})
+                    event=EventSpec("RECONCILED", {"result": "no_idempotency_key"}))
                 continue
             record = await self._billing.get_refund_status(step.idempotency_key, run.user_id)
             if record is None:
                 await self._store.update_step_status(
                     run.id, step.step_key, StepStatus.OUTCOME_UNKNOWN, StepStatus.READY,
-                    event_type="RECONCILED", event_payload={"result": "not_found"})
+                    event=EventSpec("RECONCILED", {"result": "not_found"}))
             elif record["status"] == "succeeded":
                 await self._store.update_step_status(
                     run.id, step.step_key, StepStatus.OUTCOME_UNKNOWN, StepStatus.SUCCEEDED,
-                    event_type="RECONCILED", event_payload={"result": "succeeded"})
+                    event=EventSpec("RECONCILED", {"result": "succeeded"}))
                 await self._activate(run.id, StepKey.POLL_REFUND_STATUS.value)
             elif record["status"] == "failed":
                 await self._store.update_step_status(
                     run.id, step.step_key, StepStatus.OUTCOME_UNKNOWN, StepStatus.FAILED,
                     error_code="refund_failed",
-                    event_type="RECONCILED", event_payload={"result": "failed"})
+                    event=EventSpec("RECONCILED", {"result": "failed"}))
                 run = await self._store.update_run_status(
                     run.id, run.version, RunStatus.FAILED,
                     lease_owner=self._owner, error_code="refund_failed", retryable=False,
                     response_json={"response": "退款最终状态为失败，请核对账单或联系人工客服。"},
-                    event_type="RUN_FAILED", event_payload={"reason": "refund_failed"})
+                    event=EventSpec("RUN_FAILED", {"reason": "refund_failed"}))
                 runtime_metrics.record_run_terminal(run.task_type, RunStatus.FAILED.value)
                 await self._release_lease(run)
                 return False
@@ -524,7 +524,7 @@ class TaskEngine:
                 # submitted/processing：幂等重提（相同 operation_id 返回相同记录）
                 await self._store.update_step_status(
                     run.id, step.step_key, StepStatus.OUTCOME_UNKNOWN, StepStatus.READY,
-                    event_type="RECONCILED", event_payload={"result": "in_flight"})
+                    event=EventSpec("RECONCILED", {"result": "in_flight"}))
         return True
 
     async def _rebuild_context(self, steps: List[RunStep]) -> dict:
@@ -601,7 +601,7 @@ class TaskEngine:
                 current_step=answer_step.step_key, lease_owner=self._owner,
                 result_json={"collected": (answer_step.output_json or {}).get("collected", {})},
                 response_json={"response": answer},
-                event_type="RUN_SUCCEEDED", event_payload={"rebuilt_from_step": True},
+                event=EventSpec("RUN_SUCCEEDED", {"rebuilt_from_step": True}),
             )
             runtime_metrics.record_run_terminal(run.task_type, RunStatus.SUCCEEDED.value)
             await self._commit_transcript(run, answer)
@@ -611,7 +611,7 @@ class TaskEngine:
             run = await self._store.update_run_status(
                 run_id, run.version, RunStatus.FAILED,
                 lease_owner=self._owner, error_code="plan_exhausted", retryable=False,
-                event_type="RUN_FAILED", event_payload={"reason": "plan_exhausted"},
+                event=EventSpec("RUN_FAILED", {"reason": "plan_exhausted"}),
             )
             runtime_metrics.record_run_terminal(run.task_type, RunStatus.FAILED.value)
             await self._release_lease(run)
@@ -691,12 +691,12 @@ class TaskEngine:
         """瞬时故障统一出口：Step 回 READY、Run 落 PAUSED 可重试（P1-2）。"""
         await self._store.update_step_status(
             run.id, step.step_key, StepStatus.RUNNING, StepStatus.READY,
-            event_type="STEP_NEEDS_RETRY", event_payload={"error": error_code})
+            event=EventSpec("STEP_NEEDS_RETRY", {"error": error_code}))
         run = await self._store.update_run_status(
             run.id, run.version, RunStatus.PAUSED,
             lease_owner=self._owner, current_step=step.step_key,
             error_code=error_code, retryable=True,
-            event_type="RUN_PAUSED", event_payload={"reason": reason})
+            event=EventSpec("RUN_PAUSED", {"reason": reason}))
         await self._release_lease(run)
         context["_finished"] = True
         return StepOutcome()
@@ -879,7 +879,7 @@ class TaskEngine:
                 if current.status == StepStatus.PENDING:
                     await self._store.update_step_status(
                         run.id, key.value, StepStatus.PENDING, StepStatus.SKIPPED,
-                        event_type="STEP_SKIPPED", event_payload={"reason": "no_duplicate"})
+                        event=EventSpec("STEP_SKIPPED", {"reason": "no_duplicate"}))
             await self._activate(run.id, StepKey.BUILD_NO_REFUND_ANSWER.value)
         return StepOutcome(
             input={"charge_count": len(amounts),
@@ -977,8 +977,8 @@ class TaskEngine:
         # 执行写工具前持久化幂等键，重试复用相同键（9.2 节）
         await self._store.set_step_idempotency_key(
             run.id, step.step_key, key,
-            event_type="TOOL_ATTEMPTED", event_payload={"tool": "submit_refund",
-                           "idempotency_key_hash": hashlib.sha256(key.encode()).hexdigest()[:16]})
+            event=EventSpec("TOOL_ATTEMPTED", {"tool": "submit_refund",
+                           "idempotency_key_hash": hashlib.sha256(key.encode()).hexdigest()[:16]}))
         try:
             spec = self._tool_registry["submit_refund"]
             record = await self._invoke_tool(
@@ -1006,11 +1006,11 @@ class TaskEngine:
             # 外部可能已执行：进入 OUTCOME_UNKNOWN，随后对账收敛（11.3 节）
             await self._store.update_step_status(
                 run.id, step.step_key, StepStatus.RUNNING, StepStatus.OUTCOME_UNKNOWN,
-                event_type="OUTCOME_UNKNOWN", event_payload={"operation_id": ex.operation_id})
+                event=EventSpec("OUTCOME_UNKNOWN", {"operation_id": ex.operation_id}))
             run = await self._store.update_run_status(
                 run.id, run.version, RunStatus.OUTCOME_UNKNOWN,
                 lease_owner=self._owner, current_step=step.step_key,
-                event_type="OUTCOME_UNKNOWN")
+                event=EventSpec("OUTCOME_UNKNOWN"))
             runtime_metrics.record_outcome_unknown(run.task_type)
             await self._release_lease(run)
             context["_finished"] = True

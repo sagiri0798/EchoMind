@@ -13,7 +13,7 @@ from runtime.billing import (
     demo_seed,
 )
 from runtime.engine import TaskEngine
-from runtime.models import ApprovalDecision, RunStatus, StepStatus
+from runtime.models import ApprovalDecision, EventSpec, RunStatus, StepStatus
 from runtime.recovery import TaskRecovery
 from runtime.store import RunStore
 
@@ -72,7 +72,7 @@ async def advance_to_waiting_approval(env):
 async def approve(env, run, decision=ApprovalDecision.APPROVED):
     await env.store.decide_approval(run.id, "APPROVAL_GATE", decision, decided_by="admin")
     return await env.store.update_run_status(run.id, run.version, RunStatus.RUNNING,
-                                             event_type="RUN_RESUMED")
+                                             event=EventSpec("RUN_RESUMED"))
 
 
 # ── 写工具结果未知 → 重启对账，不重复退款（#8/#9）────────
@@ -430,7 +430,7 @@ async def test_cancel_resume_race_has_explainable_outcome(tmp_path):
         try:
             current = await env.store.get_run(run.id)
             await env.store.update_run_status(current.id, current.version, RunStatus.CANCELLED,
-                                              event_type="RUN_CANCELLED", event_payload={"by": "user"})
+                                              event=EventSpec("RUN_CANCELLED", {"by": "user"}))
         except VersionConflictError:
             pass  # 并发下输掉 CAS 的一方按 409 处理（API 层语义）
 
@@ -441,7 +441,7 @@ async def test_cancel_resume_race_has_explainable_outcome(tmp_path):
             current = await env.store.get_run(run.id)
             if current.status != RunStatus.RUNNING:
                 await env.store.update_run_status(current.id, current.version, RunStatus.RUNNING,
-                                                  event_type="RUN_RESUMED")
+                                                  event=EventSpec("RUN_RESUMED"))
         except (VersionConflictError, IllegalTransitionError):
             pass  # 并发下输掉 CAS 或状态已被取消的一方按 409 处理（API 层语义）
 

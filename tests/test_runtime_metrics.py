@@ -13,7 +13,7 @@ from runtime.billing import (
     demo_seed,
 )
 from runtime.engine import TaskEngine
-from runtime.models import ApprovalDecision, RunStatus
+from runtime.models import ApprovalDecision, EventSpec, RunStatus
 from runtime.store import RunStore
 
 
@@ -73,7 +73,7 @@ async def test_success_flow_increments_runs_and_steps(env):
     await store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.APPROVED,
                                 decided_by="admin")
     await store.update_run_status(run.id, run.version, RunStatus.RUNNING,
-                                  event_type="RUN_RESUMED")
+                                  event=EventSpec("RUN_RESUMED"))
     await engine.run(run.id)
 
     assert counter_value(metrics.runs_total, task_type="duplicate_charge_refund",
@@ -94,7 +94,7 @@ async def test_outcome_unknown_and_duplicate_prevented_metrics(env):
     await store.decide_approval(run.id, "APPROVAL_GATE", ApprovalDecision.APPROVED,
                                 decided_by="admin")
     await store.update_run_status(run.id, run.version, RunStatus.RUNNING,
-                                  event_type="RUN_RESUMED")
+                                  event=EventSpec("RUN_RESUMED"))
     billing.enable_fault(FAIL_AFTER_EFFECT_BEFORE_RESPONSE)
     await engine.run(run.id)
     assert counter_value(metrics.outcome_unknown_total,
@@ -125,7 +125,7 @@ async def test_failed_run_and_approval_metrics(env):
     before_reject = counter_value(metrics.runs_total, task_type="duplicate_charge_refund",
                           status="FAILED")
     run = await store.update_run_status(run.id, run.version, RunStatus.RUNNING,
-                                        event_type="RUN_RESUMED")
+                                        event=EventSpec("RUN_RESUMED"))
     await engine.run(run.id)
     assert counter_value(metrics.runs_total, task_type="duplicate_charge_refund",
                  status="FAILED") == before_reject + 1

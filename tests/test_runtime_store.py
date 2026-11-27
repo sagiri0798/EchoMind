@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 import pytest
 import pytest_asyncio
 
-from runtime.models import Run, RunStatus, RunStep, StepStatus
+from runtime.models import EventSpec, Run, RunStatus, RunStep, StepStatus
 from runtime.store import (
     DuplicateRunError,
     IllegalTransitionError,
@@ -153,7 +153,7 @@ async def test_transition_can_record_event_in_same_transaction(store):
     run = await store.create_run(**make_run_fields())
     await store.update_run_status(
         run.id, 0, RunStatus.RUNNING,
-        event_type="RUN_RESUMED", event_payload={"reason": "测试"},
+        event=EventSpec("RUN_RESUMED", {"reason": "测试"}),
     )
     events = await store.get_events(run.id)
     assert [e.event_type for e in events] == ["RUN_CREATED", "RUN_RESUMED"]

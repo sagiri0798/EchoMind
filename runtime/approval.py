@@ -8,7 +8,7 @@ api 与引擎共用同一实现，避免"拒绝"语义出现两份分歧（A6）
 import logging
 from typing import Optional
 
-from runtime.models import ApprovalDecision, Run, RunStatus, StepStatus
+from runtime.models import ApprovalDecision, EventSpec, Run, RunStatus, StepStatus
 from runtime.plans import StepKey
 from runtime.store import IllegalTransitionError, RunStore, StepNotFoundError
 
@@ -41,14 +41,14 @@ async def apply_rejected(store: RunStore, run: Run, step_key: str,
         if current.status == StepStatus.PENDING:
             await store.update_step_status(
                 run.id, key.value, StepStatus.PENDING, StepStatus.SKIPPED,
-                event_type="STEP_SKIPPED", event_payload={"reason": "approval_rejected"})
+                event=EventSpec("STEP_SKIPPED", {"reason": "approval_rejected"}))
     # 状态机：WAITING_APPROVAL → RUNNING → FAILED 两步走（5.3 节）
     if run.status == RunStatus.WAITING_APPROVAL:
         run = await store.update_run_status(
             run.id, run.version, RunStatus.RUNNING,
-            lease_owner=lease_owner, event_type="RUN_RESUMED", event_payload={"reason": "approval_rejected"})
+            lease_owner=lease_owner, event=EventSpec("RUN_RESUMED", {"reason": "approval_rejected"}))
     return await store.update_run_status(
         run.id, run.version, RunStatus.FAILED,
         lease_owner=lease_owner, error_code="approval_rejected", retryable=False,
         response_json={"response": REJECTED_ANSWER},
-        event_type="RUN_FAILED", event_payload={"reason": "approval_rejected"})
+        event=EventSpec("RUN_FAILED", {"reason": "approval_rejected"}))

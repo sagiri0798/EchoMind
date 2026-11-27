@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import List
 
 from runtime.billing import SandboxBillingClient
-from runtime.models import ApprovalDecision, RunStatus, StepStatus
+from runtime.models import ApprovalDecision, EventSpec, RunStatus, StepStatus
 from runtime.plans import StepKey
 from runtime.store import RunStore
 from runtime.tools import build_runtime_tools, write_tool_names
@@ -49,12 +49,12 @@ class TaskRecovery:
                     # 写 Step 结果未知：先对账再决定，不能直接重试
                     await self._store.update_step_status(
                         run.id, step.step_key, StepStatus.RUNNING, StepStatus.OUTCOME_UNKNOWN,
-                        event_type="RECOVERY_SCAN", event_payload={"action": "outcome_unknown"})
+                        event=EventSpec("RECOVERY_SCAN", {"action": "outcome_unknown"}))
                 else:
                     # 只读 Step：回到 READY 允许重试
                     await self._store.update_step_status(
                         run.id, step.step_key, StepStatus.RUNNING, StepStatus.READY,
-                        event_type="RECOVERY_SCAN", event_payload={"action": "retry"})
+                        event=EventSpec("RECOVERY_SCAN", {"action": "retry"}))
                 changed = True
             if changed or run.status in (RunStatus.RUNNING, RunStatus.OUTCOME_UNKNOWN,
                                          RunStatus.PAUSED):

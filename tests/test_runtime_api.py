@@ -734,7 +734,7 @@ async def test_failed_run_view_has_no_plaintext_business_ids(services):
     import pathlib
     from runtime.billing import SandboxBillingClient
     from runtime.engine import TaskEngine
-    from runtime.models import ApprovalDecision
+    from runtime.models import ApprovalDecision, EventSpec
 
     order_id = "ORDPLAIN12345"
     store, http = services
@@ -764,7 +764,7 @@ async def test_failed_run_view_has_no_plaintext_business_ids(services):
                                     ApprovalDecision.APPROVED, decided_by="admin")
         current = await store.update_run_status(
             run.id, current.version, RunStatus.RUNNING,
-            event_type="RUN_RESUMED")
+            event=EventSpec("RUN_RESUMED"))
         await engine.run(run.id)
         return await store.get_run(run.id)
 

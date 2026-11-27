@@ -21,6 +21,14 @@ def now_iso() -> str:
     return datetime.now().isoformat()
 
 
+@dataclass(frozen=True)
+class EventSpec:
+    """一次待落库的审计事件（A3：用参数对象替代 event_type + event_payload 成对参数）。"""
+
+    type: str
+    payload: Optional[dict] = None
+
+
 class RunStatus(str, Enum):
     """Run 生命周期状态，值即数据库存储值（实施计划 5.1 节）。"""
 

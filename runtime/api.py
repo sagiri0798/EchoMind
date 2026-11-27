@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 from core.redaction import redact
 from runtime import metrics as runtime_metrics
-from runtime.models import ApprovalDecision, RunStatus, StepStatus
+from runtime.models import ApprovalDecision, EventSpec, RunStatus, StepStatus
 from runtime.policy import anonymous_approval_allowed
 from runtime.store import (
     ApprovalAlreadyDecidedError,
@@ -374,7 +374,7 @@ async def cancel_run(run_id: str, request: Request):
         elif run.status in _CANCELABLE_WAITING:
             updated = await store.update_run_status(
                 run_id, expected_version=run.version, next_status=RunStatus.CANCELLED,
-                event_type="RUN_CANCELLED", event_payload={"by": "user"},
+                event=EventSpec("RUN_CANCELLED", {"by": "user"}),
             )
         else:
             raise HTTPException(409, f"当前状态 {run.status.value} 不允许取消")
@@ -415,7 +415,7 @@ async def resume_run(run_id: str, body: RunResumeRequest, request: Request):
         if run.status != RunStatus.RUNNING:
             run = await store.update_run_status(
                 run_id, run.version, RunStatus.RUNNING,
-                event_type="RUN_RESUMED", event_payload={"reason": "user_input"})
+                event=EventSpec("RUN_RESUMED", {"reason": "user_input"}))
     except VersionConflictError as ex:
         raise HTTPException(409, "Run 已被修改，请重新查询后再操作") from ex
     runtime_metrics.record_resume("user_input")
